@@ -22,10 +22,26 @@ def read_table(path: str) -> pd.DataFrame:
 @dataclass
 class StockManager:
     df: pd.DataFrame = field(default_factory=pd.DataFrame)
+    stock_column: str = "Остаток"
+
+    def _detect_stock_column(self) -> Optional[str]:
+        """Return the column name that contains stock values."""
+        for col in self.df.columns:
+            name = col.strip().lower()
+            if "остаток" in name or "остатки" in name:
+                return col
+        return None
 
     def load(self, path: str):
         self.df = read_table(path)
-        self.df["Остаток"] = self.df["Остаток"].astype(float)
+        col = self._detect_stock_column()
+        if not col:
+            cols = ", ".join(self.df.columns)
+            raise ValueError(
+                f"Не найдена колонка с остатками. Ожидались названия вроде 'Остаток'. Найдены: {cols}"
+            )
+        self.stock_column = col
+        self.df[self.stock_column] = self.df[self.stock_column].astype(float)
         self.df["Цена"] = self.df["Цена"].astype(float)
         duplicates = self.df[self.df.duplicated("Артикул")]
         if not duplicates.empty:
@@ -36,9 +52,9 @@ class StockManager:
         rows = self.df[self.df["Артикул"] == article]
         if not rows.empty:
             row = rows.iloc[0]
-            if row["Остаток"] >= qty:
+            if row[self.stock_column] >= qty:
                 idx = row.name
-                self.df.at[idx, "Остаток"] -= qty
+                self.df.at[idx, self.stock_column] -= qty
                 return row
         return None
 
@@ -48,7 +64,7 @@ class StockManager:
             (self.df["Цвет"] == color) &
             (self.df["Покрытие"] == coating) &
             (self.df["Артикул"].isin(used) == False) &
-            (self.df["Остаток"] > 0)
+            (self.df[self.stock_column] > 0)
         ]
         if "Ширина" in candidates.columns:
             candidates = candidates[abs(candidates["Ширина"].astype(float) - width) <= 10]
@@ -91,9 +107,9 @@ class InvoiceProcessor:
                 continue
             # search analog
             analog = self.stock.find_analog(row.get("Категория", ""), row.get("Цвет", ""), row.get("Покрытие", ""), row.get("Ширина", 0), self.used_analogs)
-            if analog is not None and analog["Остаток"] >= qty:
+            if analog is not None and analog[self.stock.stock_column] >= qty:
                 idx = analog.name
-                self.stock.df.at[idx, "Остаток"] -= qty
+                self.stock.df.at[idx, self.stock.stock_column] -= qty
                 self.used_analogs.append(analog["Артикул"])
                 self.result_rows.append({
                     "Артикул": analog["Артикул"],
