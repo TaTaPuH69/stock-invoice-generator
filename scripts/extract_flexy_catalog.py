@@ -26,7 +26,9 @@ for p in range(1, 15):
             fam  = name.split()[0]
             # сканируем 3‑4 нижних строки на «цвет / длина / цена»
             blk = df.iloc[i+1:i+5].fillna(method="ffill", axis=1)
-                    blk = df.iloc[i+1:i+5].fillna(method="ffill", axis=1)
+            # сканируем 3-4 нижних строки на цвет / длина / цена
+            blk = df.iloc[i+1:i+5].fillna(method="ffill", axis=1)
+
         for _, r in blk.iterrows():
             # безопасно берём цвет
             raw_color = r.iloc[0]
@@ -42,13 +44,14 @@ for p in range(1, 15):
 
             for ln in lens:
                 rows.append({
-                    "code": code,
-                    "name": name,
-                    "family": fam,
-                    "category": CAT.get(p, "прочее"),
-                    "color": color,
-                    "length_m": float(ln.replace(",", ".")),
-                    "price_rub": price
+                    "code":       code,
+                    "name":       name,
+                    "family":     fam,
+                    "category":   CAT.get(p, "прочее"),
+                    "color":      color,
+                    "length_m":   float(ln.replace(",", ".")),
+                    "price_rub":  price
                 })
+
 pd.DataFrame(rows).drop_duplicates().to_excel(OUT, index=False)
 print(f"✅ catalog saved: {OUT}")
