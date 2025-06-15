@@ -163,9 +163,9 @@ class InvoiceProcessor:
                         self.stock.df.at[idx, self.stock.stock_column] -= qty
                         self.used_analogs.append(art)   # запомним, что заменяли
                         # правим последнюю записанную строку
-                        self.result_rows[-1]["Артикул"] = analog["Артикул"]
-                        self.result_rows[-1]["Замена"]  = f"замена на {analog['Артикул']}"
-                        continue        # ← тот самый continue, 8 пробелов от начала строки блока
+                    self.result_rows[-1]["Артикул"] = analog["Артикул"]
+                    self.result_rows[-1]["Замена"]  = f"замена на {analog['Артикул']}"
+                    continue        # ← тот самый continue, 8 пробелов от начала строки блока
 
 
                 # search analog
