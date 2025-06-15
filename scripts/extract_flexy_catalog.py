@@ -55,4 +55,4 @@ for p in range(1, 15):
                         "price_rub": price
                     })
 pd.DataFrame(rows).drop_duplicates().to_excel(OUT, index=False)
-print(f"✅ catalog saved: {OUT}")
+print(f"[OK] catalog saved: {OUT}")
