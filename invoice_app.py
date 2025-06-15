@@ -148,27 +148,24 @@ class InvoiceProcessor:
                 }
             )
 
-            # 4) если товара нет — подбираем *физический* аналог по правилам склада
-            if stock_row is None:
-                analog = self.stock.find_analog(
-                    row.get("Категория",  ""),      # категория
-                    row.get("Цвет",       ""),      # цвет
-                    row.get("Покрытие",   ""),      # покрытие
-                    row.get("Ширина",     0),       # ширина/длина
-                    self.used_analogs,              # уже использованные
-                )
-
-                if analog is not None and analog[self.stock.stock_column] >= qty:
-                    idx = analog.name
-                    # списываем остаток
-                    self.stock.df.at[idx, self.stock.stock_column] -= qty
-                    self.used_analogs.append(art)   # запомним, что заменяли
-
-                    # правим последнюю записанную строку
-                    self.result_rows[-1]["Артикул"] = analog["Артикул"]
-                    self.result_rows[-1]["Замена"]  = f"замена на {analog['Артикул']}"
-                    continue  # ← ровно 8 пробелов перед continue
-
+                # 4) если товара нет — подбираем *физический* аналог по правилам склада
+                if stock_row is None:
+                    analog = self.stock.find_analog(
+                        row.get("Категория",  ""),      # категория
+                        row.get("Цвет",       ""),      # цвет
+                        row.get("Покрытие",   ""),      # покрытие
+                        row.get("Ширина",     0),       # ширина/длина
+                        self.used_analogs,              # уже использованные
+                    )
+                    if analog is not None and analog[self.stock.stock_column] >= qty:
+                        idx = analog.name
+                        # списываем остаток
+                        self.stock.df.at[idx, self.stock.stock_column] -= qty
+                        self.used_analogs.append(art)   # запомним, что заменяли
+                        # правим последнюю записанную строку
+                        self.result_rows[-1]["Артикул"] = analog["Артикул"]
+                        self.result_rows[-1]["Замена"]  = f"замена на {analog['Артикул']}"
+                        continue  # <-- этот continue теперь на правильном уровне
 
 
                 # search analog
