@@ -113,33 +113,36 @@ class InvoiceProcessor:
         self.original_sum = (self.df["Количество"] * self.df["Цена"]).sum()
         logging.info(f"Загружен счет на сумму {self.original_sum:.2f}")
 
-    def process(self):
-        # --------------------------------------------------
-        #  перебираем строки счёта и резервируем позиции
-        # --------------------------------------------------
-        self.used_analogs: list[str] = []          # список уже-использованных
+class InvoiceProcessor:
+    def process(self) -> None:
+        """
+        Проходит по строкам счёта и пытается зарезервировать позиции на складе.
+        Если нужного артикула нет – пытается найти физический аналог.
+        Итог кладётся в self.result_rows.
+        """
+        self.used_analogs: list[str] = []          # аналоги, уже использованные в этом счёте
 
-        for _, row in self.df.iterrows():          # ← 8 пробелов
+        for _, row in self.df.iterrows():
             art      = row["Артикул"]
             length_m = row.get("Длина, м", 0)
 
-            # 1) пробуем найти артикул-аналог по каталогу
+            # --- 1. каталог Flexy ------------------------------------------------------------
             analog_code = find_analog(art, length_m)
 
-            if analog_code:                        # ← 12 пробелов
+            if analog_code:                         # взяли аналог из каталога
                 art_to_use = analog_code
                 comment    = f"замена на {analog_code}"
-            else:
+            else:                                   # берём исходный артикул
                 art_to_use = art
                 comment    = ""
 
             qty   = row["Количество"]
             price = row["Цена"]
 
-            # 2) резервируем выбранный артикул
+            # --- 2. пробуем зарезервировать выбранный артикул -------------------------------
             stock_row = self.stock.allocate(art_to_use, qty)
 
-            # 3) добавляем строку в результат
+            # сохраняем строку в результате сразу – дальше либо подчистим, либо оставим как есть
             self.result_rows.append({
                 "Артикул":    art_to_use,
                 "Количество": qty,
@@ -147,28 +150,11 @@ class InvoiceProcessor:
                 "Замена":     comment,
             })
 
-            # 4) если товара нет — ищем *физический* аналог
-            if stock_row is None:                  # ← 12 пробелов
-                analog = self.stock.find_analog(   # 16 пробелов
-                    row.get("Категория",  ""),     # категория
-                    row.get("Цвет",       ""),     # цвет
-                    row.get("Покрытие",   ""),     # покрытие
-                    row.get("Ширина",     0),      # ширина/длина
-                    self.used_analogs,             # уже использованные
-                )
+            # --- 3. если артикул нашли на складе – переходим к следующей строке -------------
+            if stock_row is not None:
+                continue                            # ← внутри цикла for, ОК
 
-                if analog is not None and analog[self.stock.stock_column] >= qty:
-                    idx = analog.name
-                    # списываем остаток
-                    self.stock.df.at[idx, self.stock.stock_column] -= qty
-                    self.used_analogs.append(art)
-
-                    # правим ПОСЛЕДНЮЮ добавленную строку
-                    self.result_rows[-1]["Артикул"] = analog["Артикул"]
-                    self.result_rows[-1]["Замена"]  = f"замена на {analog['Артикул']}"
-                    continue                        # ← 20 пробелов (внутри if analog)
-
-            # --- поиск аналога НЕ понадобился ---
+            # --- 4. ищем физический аналог по правилам склада -------------------------------
             analog = self.stock.find_analog(
                 row.get("Категория",  ""),
                 row.get("Цвет",       ""),
@@ -176,20 +162,23 @@ class InvoiceProcessor:
                 row.get("Ширина",     0),
                 self.used_analogs,
             )
-            if analog is not None and analog[self.stock.stock_column] >= qty:
-                idx = analog.name
-                self.stock.df.at[idx, self.stock.stock_column] -= qty
-                self.used_analogs.append(analog["Артикул"])
-                self.result_rows.append({
-                    "Артикул":    analog["Артикул"],
-                    "Количество": qty,
-                    "Цена":       analog["Цена"],
-                    "Замена":     art,             # что заменили
-                })
-                self.log.append(f"{art} заменен на {analog['Артикул']}")
+
+            if analog is None or analog[self.stock.stock_column] < qty:
+                # аналога нет – только логируем
                 self.log.append(f"Не удалось найти {art} в нужном количестве")
                 logging.error(f"Не удалось найти {art} в нужном количестве")
-                continue                            # ← 16 пробелов (внутри for-цикла)
+                continue                            # ← снова внутри цикла for
+
+            # --- 5. списываем остаток и правим добавленную строку ---------------------------
+            idx = analog.name
+            self.stock.df.at[idx, self.stock.stock_column] -= qty
+            self.used_analogs.append(art)           # запомним, что заменяли
+
+            last = self.result_rows[-1]             # правим последнюю добавленную строку
+            last["Артикул"] = analog["Артикул"]
+            last["Замена"]  = f"замена на {analog['Артикул']}"
+            self.log.append(f"{art} заменен на {analog['Артикул']}")
+
 
     def to_dataframe(self) -> pd.DataFrame:
         df = pd.DataFrame(self.result_rows)
