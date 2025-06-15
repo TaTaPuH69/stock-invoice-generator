@@ -164,8 +164,10 @@ class InvoiceProcessor:
                         self.used_analogs.append(art)   # запомним, что заменяли
                         # правим последнюю записанную строку
                         self.result_rows[-1]["Артикул"] = analog["Артикул"]
-                        self.result_rows[-1]["Замена"]  = f"замена на {analog['Артикул']}"
-                                continue
+                        self.result_rows[-1]["Замена"] = f"замена на {analog['Артикул']}"
+        # ← 8 пробелов ↓
+        continue
+
             # search analog
             analog = self.stock.find_analog(row.get("Категория", ""), row.get("Цвет", ""), row.get("Покрытие", ""), row.get("Ширина", 0), self.used_analogs)
             if analog is not None and analog[self.stock.stock_column] >= qty:
