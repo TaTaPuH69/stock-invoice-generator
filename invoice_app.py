@@ -166,7 +166,7 @@ class InvoiceProcessor:
                         self.result_rows[-1]["Артикул"] = analog["Артикул"]
                         self.result_rows[-1]["Замена"] = f"замена на {analog['Артикул']}"
         # ← 8 пробелов ↓
-        continue
+                continue
 
             # search analog
             analog = self.stock.find_analog(row.get("Категория", ""), row.get("Цвет", ""), row.get("Покрытие", ""), row.get("Ширина", 0), self.used_analogs)
