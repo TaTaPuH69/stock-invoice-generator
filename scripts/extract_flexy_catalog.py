@@ -2,7 +2,7 @@
 from pathlib import Path
 import camelot, re, pandas as pd
 
-PDF = Path("Flexy.pdf")
+PDF = Path("Flexy.pdf")                  # имя, которое реально лежит в dir
 OUT = Path("data/profiles_catalog.xlsx")  # куда писать результат
 
 # карта «№ стра­ни­цы → ка­те­го­рия»  (можешь переименовать под себя)
