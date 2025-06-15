@@ -187,9 +187,9 @@ class InvoiceProcessor:
                     "Замена":     art,             # что заменили
                 })
                 self.log.append(f"{art} заменен на {analog['Артикул']}")
-                continue                            # ← 16 пробелов (внутри for-цикла)
                 self.log.append(f"Не удалось найти {art} в нужном количестве")
                 logging.error(f"Не удалось найти {art} в нужном количестве")
+                continue                            # ← 16 пробелов (внутри for-цикла)
 
     def to_dataframe(self) -> pd.DataFrame:
         df = pd.DataFrame(self.result_rows)
