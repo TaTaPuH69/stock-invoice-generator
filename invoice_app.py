@@ -119,16 +119,16 @@ class InvoiceProcessor:
             # --------------------------------------------------
             self.used_analogs: list[str] = []           # <-- добавили список уже-использованных
             for _, row in self.df.iterrows():
-                art       = row["Артикул"]
-                length_m  = row.get("Длина, м", 0)
+                art      = row["Артикул"]
+                length_m = row.get("Длина, м", 0)
 
                 # 1) пробуем сразу найти артикул-аналог по каталогу
                 analog_code = find_analog(art, length_m)
 
-                if analog_code:                         # если найден аналог
+                if analog_code:                         # найден в каталоге
                     art_to_use = analog_code
                     comment    = f"замена на {analog_code}"
-                else:                                   # иначе берём исходный
+                else:                                   # берём исходный
                     art_to_use = art
                     comment    = ""
 
@@ -141,10 +141,10 @@ class InvoiceProcessor:
                 # 3) фиксируем строку в результирующей таблице
                 self.result_rows.append(
                     {
-                        "Артикул"   : art_to_use,
+                        "Артикул":    art_to_use,
                         "Количество": qty,
-                        "Цена"      : price,
-                        "Замена"    : comment,          # покажем, была ли подмена
+                        "Цена":       price,
+                        "Замена":     comment,          # покажем, была ли подмена
                     }
                 )
 
@@ -162,10 +162,10 @@ class InvoiceProcessor:
                         # списываем остаток
                         self.stock.df.at[idx, self.stock.stock_column] -= qty
                         self.used_analogs.append(art)   # запомним, что заменяли
-                self.result_rows[-1]["Артикул"] = analog["Артикул"]
-                self.result_rows[-1]["Замена"]  = f"замена на {analog['Артикул']}"
-        # ← здесь два уровня (8 пробелов)
-        continue
+                        # правим последнюю записанную строку
+                        self.result_rows[-1]["Артикул"] = analog["Артикул"]
+                        self.result_rows[-1]["Замена"]  = f"замена на {analog['Артикул']}"
+                        continue        # ← тот самый continue, 8 пробелов от начала строки блока
 
 
             # search analog
