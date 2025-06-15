@@ -113,7 +113,7 @@ class InvoiceProcessor:
         self.original_sum = (self.df["Количество"] * self.df["Цена"]).sum()
         logging.info(f"Загружен счет на сумму {self.original_sum:.2f}")
 
-            def process(self):
+    def process(self):
             # --------------------------------------------------
             #  перебираем строки счёта и резервируем позиции
             # --------------------------------------------------
