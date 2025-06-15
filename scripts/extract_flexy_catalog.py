@@ -27,7 +27,7 @@ for p in range(1, 15):
             # сканируем 3‑4 нижних строки на «цвет / длина / цена»
             blk = df.iloc[i+1:i+5].fillna(method="ffill", axis=1)
             for _, r in blk.iterrows():
-                txt = " ".join(r)
+                txt = " ".join(r.fillna("").astype(str))
                 color = r.iloc[0].split()[0].lower()
                 lens  = re.findall(r"(\d+[.,]?\d*)\s*м", txt)
                 price = re.search(r"(\d+)\s*руб", txt)
