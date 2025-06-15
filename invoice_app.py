@@ -168,22 +168,22 @@ class InvoiceProcessor:
                         continue        # ← тот самый continue, 8 пробелов от начала строки блока
 
 
-            # search analog
-            analog = self.stock.find_analog(row.get("Категория", ""), row.get("Цвет", ""), row.get("Покрытие", ""), row.get("Ширина", 0), self.used_analogs)
-            if analog is not None and analog[self.stock.stock_column] >= qty:
-                idx = analog.name
-                self.stock.df.at[idx, self.stock.stock_column] -= qty
-                self.used_analogs.append(analog["Артикул"])
-                self.result_rows.append({
-                    "Артикул": analog["Артикул"],
-                    "Количество": qty,
-                    "Цена": analog["Цена"],
-                    "Замена": art
-                })
-                self.log.append(f"{art} заменен на {analog['Артикул']}")
-                continue
-            self.log.append(f"Не удалось найти {art} в нужном количестве")
-            logging.error(f"Не удалось найти {art} в нужном количестве")
+                # search analog
+                analog = self.stock.find_analog(row.get("Категория", ""), row.get("Цвет", ""), row.get("Покрытие", ""), row.get("Ширина", 0), self.used_analogs)
+                if analog is not None and analog[self.stock.stock_column] >= qty:
+                    idx = analog.name
+                    self.stock.df.at[idx, self.stock.stock_column] -= qty
+                    self.used_analogs.append(analog["Артикул"])
+                    self.result_rows.append({
+                        "Артикул": analog["Артикул"],
+                        "Количество": qty,
+                        "Цена": analog["Цена"],
+                        "Замена": art
+                    })
+                    self.log.append(f"{art} заменен на {analog['Артикул']}")
+                    continue
+                self.log.append(f"Не удалось найти {art} в нужном количестве")
+                logging.error(f"Не удалось найти {art} в нужном количестве")
 
     def to_dataframe(self) -> pd.DataFrame:
         df = pd.DataFrame(self.result_rows)
