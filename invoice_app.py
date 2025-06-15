@@ -4,6 +4,28 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 from tkinter import Tk, filedialog, messagebox, Text, Scrollbar, Button, END
+import pandas as pd
+import logging
+import os
+# (остальные ваши импорты)
+
+# ─────── КАТАЛОГ ───────
+from pathlib import Path
+import pandas as pd          # ← если уже выше, эту строку можно убрать
+
+CATALOG_PATH = Path("profiles_catalog.xlsx")
+_catalog = pd.read_excel(CATALOG_PATH)
+
+def find_analog(code: str, length: float) -> str | None:
+    fam = _catalog.loc[_catalog["code"] == code, "family"]
+    if fam.empty:
+        return None
+    fam = fam.iat[0]
+    subset = _catalog.query("family == @fam and length_m == @length")
+    if subset.empty:
+        return None
+    return subset.sort_values("price_rub").iloc[0]["code"]
+# ───────────────────────
 
 logging.basicConfig(filename="app.log", level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
@@ -91,20 +113,59 @@ class InvoiceProcessor:
         self.original_sum = (self.df["Количество"] * self.df["Цена"]).sum()
         logging.info(f"Загружен счет на сумму {self.original_sum:.2f}")
 
-    def process(self):
-        for _, row in self.df.iterrows():
-            art = row["Артикул"]
-            qty = row["Количество"]
-            price = row["Цена"]
-            stock_row = self.stock.allocate(art, qty)
-            if stock_row is not None:
-                self.result_rows.append({
-                    "Артикул": art,
-                    "Количество": qty,
-                    "Цена": price,
-                    "Замена": ""
-                })
-                continue
+            def process(self):
+            # --------------------------------------------------
+            #  перебираем строки счёта и резервируем позиции
+            # --------------------------------------------------
+            self.used_analogs: list[str] = []           # <-- добавили список уже-использованных
+            for _, row in self.df.iterrows():
+                art       = row["Артикул"]
+                length_m  = row.get("Длина, м", 0)
+
+                # 1) пробуем сразу найти артикул-аналог по каталогу
+                analog_code = find_analog(art, length_m)
+
+                if analog_code:                         # если найден аналог
+                    art_to_use = analog_code
+                    comment    = f"замена на {analog_code}"
+                else:                                   # иначе берём исходный
+                    art_to_use = art
+                    comment    = ""
+
+                qty   = row["Количество"]
+                price = row["Цена"]
+
+                # 2) пытаемся зарезервировать на складе выбранный артикул
+                stock_row = self.stock.allocate(art_to_use, qty)
+
+                # 3) фиксируем строку в результирующей таблице
+                self.result_rows.append(
+                    {
+                        "Артикул"   : art_to_use,
+                        "Количество": qty,
+                        "Цена"      : price,
+                        "Замена"    : comment,          # покажем, была ли подмена
+                    }
+                )
+
+                # 4) если товара нет — подбираем *физический* аналог по правилам склада
+                if stock_row is None:
+                    analog = self.stock.find_analog(
+                        row.get("Категория",  ""),      # категория
+                        row.get("Цвет",       ""),      # цвет
+                        row.get("Покрытие",   ""),      # покрытие
+                        row.get("Ширина",     0),       # ширина/длина
+                        self.used_analogs,              # уже использованные
+                    )
+                    if analog is not None and analog[self.stock.stock_column] >= qty:
+                        idx = analog.name
+                        # списываем остаток
+                        self.stock.df.at[idx, self.stock.stock_column] -= qty
+                        self.used_analogs.append(art)   # запомним, что заменяли
+                        # правим последнюю записанную строку
+                        self.result_rows[-1]["Артикул"] = analog["Артикул"]
+                        self.result_rows[-1]["Замена"]  = f"замена на {analog['Артикул']}"
+
             # search analog
             analog = self.stock.find_analog(row.get("Категория", ""), row.get("Цвет", ""), row.get("Покрытие", ""), row.get("Ширина", 0), self.used_analogs)
             if analog is not None and analog[self.stock.stock_column] >= qty:
