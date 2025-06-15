@@ -26,22 +26,29 @@ for p in range(1, 15):
             fam  = name.split()[0]
             # сканируем 3‑4 нижних строки на «цвет / длина / цена»
             blk = df.iloc[i+1:i+5].fillna(method="ffill", axis=1)
-            for _, r in blk.iterrows():
-    raw_color = r.iloc[0]
-    # если NaN → берём пустую строку
-    raw_color = "" if pd.isna(raw_color) else str(raw_color)
-    color = raw_color.split()[0].lower() if raw_color else "unknown"
+                    blk = df.iloc[i+1:i+5].fillna(method="ffill", axis=1)
+        for _, r in blk.iterrows():
+            # безопасно берём цвет
+            raw_color = r.iloc[0]
+            raw_color = "" if pd.isna(raw_color) else str(raw_color)
+            color = raw_color.split()[0].lower() if raw_color else "unknown"
 
-    txt = " ".join(r.fillna("").astype(str))
-    lens  = re.findall(r"(\d+[.,]?\d*)\s*м", txt)
-           price_m = re.search(r"(\d+)\s*руб", txt)
-                 if not lens or not price_m:
-                  continue
-                 price = int(price_m.group(1))
-                for ln in lens:
-                    rows.append(dict(code=code, name=name, family=fam,
-                                     category=CAT.get(p, "прочее"), color=color,
-                                     length_m=float(ln.replace(",",".")),
-                                     price_rub=price))
+            txt = " ".join(r.fillna("").astype(str))
+            lens   = re.findall(r"(\d+[.,]?\d*)\s*м", txt)
+            price_m = re.search(r"(\d+)\s*руб", txt)
+            if not lens or not price_m:
+                continue
+            price = int(price_m.group(1))
+
+            for ln in lens:
+                rows.append({
+                    "code": code,
+                    "name": name,
+                    "family": fam,
+                    "category": CAT.get(p, "прочее"),
+                    "color": color,
+                    "length_m": float(ln.replace(",", ".")),
+                    "price_rub": price
+                })
 pd.DataFrame(rows).drop_duplicates().to_excel(OUT, index=False)
 print(f"✅ catalog saved: {OUT}")
