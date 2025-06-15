@@ -27,12 +27,17 @@ for p in range(1, 15):
             # сканируем 3‑4 нижних строки на «цвет / длина / цена»
             blk = df.iloc[i+1:i+5].fillna(method="ffill", axis=1)
             for _, r in blk.iterrows():
-                txt = " ".join(r.fillna("").astype(str))
-                color = r.iloc[0].split()[0].lower()
-                lens  = re.findall(r"(\d+[.,]?\d*)\s*м", txt)
-                price = re.search(r"(\d+)\s*руб", txt)
-                if not lens or not price: continue
-                price = int(price.group(1))
+    raw_color = r.iloc[0]
+    # если NaN → берём пустую строку
+    raw_color = "" if pd.isna(raw_color) else str(raw_color)
+    color = raw_color.split()[0].lower() if raw_color else "unknown"
+
+    txt = " ".join(r.fillna("").astype(str))
+    lens  = re.findall(r"(\d+[.,]?\d*)\s*м", txt)
+           price_m = re.search(r"(\d+)\s*руб", txt)
+                 if not lens or not price_m:
+                  continue
+                 price = int(price_m.group(1))
                 for ln in lens:
                     rows.append(dict(code=code, name=name, family=fam,
                                      category=CAT.get(p, "прочее"), color=color,
