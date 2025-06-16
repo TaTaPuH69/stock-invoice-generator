@@ -33,9 +33,9 @@ _catalog = pd.read_excel(CATALOG_PATH)
 def read_table(path: str) -> pd.DataFrame:
     _, ext = os.path.splitext(path)
     if ext.lower() in (".xls", ".xlsx"):
-        df = pd.read_excel(path, dtype=str)
+        df = pd.read_excel(path, dtype=str, header=7)
     else:
-        df = pd.read_csv(path, dtype=str, sep=";")
+        df = pd.read_csv(path, dtype=str, sep=";", header=7)
 
     # запятая → точка
     df = df.applymap(
@@ -63,22 +63,17 @@ class StockManager:
 
     # ── service ───────────────────────────────────────────────────
 def _detect_stock_column(self) -> Optional[str]:
-    """
-    Возвращает имя колонки с количеством на складе.
-    Принимаются варианты:
-        • остаток / остатки
-        • saldo / остаток_колво
-        • сальдо ... количество
-    """
-    for col in self.df.columns:
-        name = col.strip().lower()
+    """Возвращает имя колонки с количеством на складе.
 
-        if (
-            "остаток" in name or
-            ("сальдо" in name and "колич" in name) or
-            ("debet" in name and "колич" in name) or
-            ("quantity" in name and "end" in name)          # на всякий случай
-        ):
+    Допустимые названия:
+        • Остаток
+        • Кол-во
+        • Количество
+        • Qty
+    """
+    allowed = {"остаток", "кол-во", "количество", "qty"}
+    for col in self.df.columns:
+        if col.strip().lower() in allowed:
             return col
     return None
 
@@ -89,7 +84,7 @@ def _detect_stock_column(self) -> Optional[str]:
         col = self._detect_stock_column()
         if not col:
             raise ValueError(
-                "Не найдена колонка с остатками – ожидается столбец «Остаток»"
+                "Не найдена колонка с остатками (Остаток / Кол-во / Количество / Qty)"
             )
         self.stock_column = col
         self.df[self.stock_column] = self.df[self.stock_column].astype(float)
