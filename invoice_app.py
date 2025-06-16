@@ -100,6 +100,16 @@ class InvoiceProcessor:
     result_rows: List[dict] = field(default_factory=list)
     log: List[str] = field(default_factory=list)
 
+    def load(self, path: str):
+        self.df = read_table(path)
+        self.df["Количество"] = self.df["Количество"].astype(float)
+        self.df["Цена"] = self.df["Цена"].astype(float)
+        duplicates = self.df[self.df.duplicated("Артикул")]
+        if not duplicates.empty:
+            logging.warning(f"Дубликаты в счёте: {duplicates['Артикул'].tolist()}")
+        self.original_sum = (self.df["Количество"] * self.df["Цена"]).sum()
+        logging.info(f"Загружен счёт на сумму {self.original_sum:.2f}")
+
     def process(self) -> None:
         """
         Проходит по строкам счёта и пытается зарезервировать позиции на складе.
