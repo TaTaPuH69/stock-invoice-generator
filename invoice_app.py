@@ -91,24 +91,6 @@ class StockManager:
             return candidates.iloc[0]
         return None
 
-@dataclass
-class InvoiceProcessor:
-    stock: StockManager
-    df: pd.DataFrame = field(default_factory=pd.DataFrame)
-    original_sum: float = 0.0
-    used_analogs: List[str] = field(default_factory=list)
-    result_rows: List[dict] = field(default_factory=list)
-    log: List[str] = field(default_factory=list)
-
-    def load(self, path: str):
-        self.df = read_table(path)
-        self.df["Количество"] = self.df["Количество"].astype(float)
-        self.df["Цена"] = self.df["Цена"].astype(float)
-        duplicates = self.df[self.df.duplicated("Артикул")]
-        if not duplicates.empty:
-            logging.warning(f"Дубликаты в счете: {duplicates['Артикул'].tolist()}")
-        self.original_sum = (self.df["Количество"] * self.df["Цена"]).sum()
-        logging.info(f"Загружен счет на сумму {self.original_sum:.2f}")
 
 class InvoiceProcessor:
     stock: StockManager
