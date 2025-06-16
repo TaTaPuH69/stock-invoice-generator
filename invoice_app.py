@@ -61,6 +61,7 @@ class StockManager:
     df: pd.DataFrame = field(default_factory=pd.DataFrame)
     stock_column: str = "Остаток"
 
+
     # ── service ───────────────────────────────────────────────────
 def _detect_stock_column(self) -> Optional[str]:
     """Возвращает имя колонки с количеством на складе.
@@ -83,6 +84,7 @@ def _detect_stock_column(self) -> Optional[str]:
         self.df = read_table(path)
         col = self._detect_stock_column()
         if not col:
+
             raise ValueError(
                 "Не найдена колонка с остатками (Остаток / Кол-во / Количество / Qty)"
             )
@@ -250,8 +252,8 @@ class App:
             self.stock.load(path)
             self.stock_file = path
             self.gui_log(f"Остатки загружены: {len(self.stock.df)} строк")
-        except Exception as exc:
-            messagebox.showerror("Ошибка", str(exc))
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
 
     def load_invoice(self) -> None:
         path = filedialog.askopenfilename()
