@@ -91,7 +91,7 @@ class StockManager:
             return candidates.iloc[0]
         return None
 
-
+@dataclass
 class InvoiceProcessor:
     stock: StockManager
     df: pd.DataFrame = field(default_factory=pd.DataFrame)
