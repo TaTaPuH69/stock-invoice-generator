@@ -62,12 +62,26 @@ class StockManager:
     stock_column: str = "Остаток"
 
     # ── service ───────────────────────────────────────────────────
-    def _detect_stock_column(self) -> Optional[str]:
-        for col in self.df.columns:
-            name = col.strip().lower()
-            if "остаток" in name or "остатки" in name:
-                return col
-        return None
+def _detect_stock_column(self) -> Optional[str]:
+    """
+    Возвращает имя колонки с количеством на складе.
+    Принимаются варианты:
+        • остаток / остатки
+        • saldo / остаток_колво
+        • сальдо ... количество
+    """
+    for col in self.df.columns:
+        name = col.strip().lower()
+
+        if (
+            "остаток" in name or
+            ("сальдо" in name and "колич" in name) or
+            ("debet" in name and "колич" in name) or
+            ("quantity" in name and "end" in name)          # на всякий случай
+        ):
+            return col
+    return None
+
 
     # ── public API ────────────────────────────────────────────────
     def load(self, path: str) -> None:
