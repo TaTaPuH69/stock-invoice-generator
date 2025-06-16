@@ -14,6 +14,8 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+import numpy as np
+
 import pandas as pd
 from tkinter import Tk, filedialog, messagebox, Text, Scrollbar, Button, END
 
@@ -61,32 +63,53 @@ class StockManager:
     df: pd.DataFrame = field(default_factory=pd.DataFrame)
     stock_column: str = "Остаток"
 
-    # ── service ───────────────────────────────────────────────────
-def _detect_stock_column(self) -> Optional[str]:
-    """Возвращает имя колонки с количеством на складе.
-
-    Допустимые названия:
-        • Остаток
-        • Кол-во
-        • Количество
-        • Qty
-    """
-    allowed = {"остаток", "кол-во", "количество", "qty"}
-    for col in self.df.columns:
-        if col.strip().lower() in allowed:
-            return col
-    return None
-
-
     # ── public API ────────────────────────────────────────────────
     def load(self, path: str) -> None:
-        self.df = read_table(path)
-        col = self._detect_stock_column()
-        if not col:
+        _, ext = os.path.splitext(path)
+        if ext.lower() in (".xls", ".xlsx"):
+            raw = pd.read_excel(path, header=None, dtype=str)
+        else:
+            raw = pd.read_csv(path, header=None, dtype=str, sep=";")
+
+        matches = raw.applymap(
+            lambda x: isinstance(x, str) and x.strip().lower() == "дебет"
+        )
+        row_idx, col_idx = np.where(matches)
+        if len(row_idx) == 0:
+            raise ValueError("В Excel не найдена ячейка 'Дебет'")
+
+        stock_header_row = int(row_idx[0])
+        stock_header_col = int(col_idx[0] + 1)
+        stock_header = str(raw.iat[stock_header_row, stock_header_col]).strip()
+
+        if ext.lower() in (".xls", ".xlsx"):
+            df = pd.read_excel(
+                path,
+                header=stock_header_row,
+                skiprows=list(range(stock_header_row + 1)),
+                dtype=str,
+            )
+        else:
+            df = pd.read_csv(
+                path,
+                header=stock_header_row,
+                skiprows=list(range(stock_header_row + 1)),
+                dtype=str,
+                sep=";",
+            )
+
+        df = df.applymap(
+            lambda x: str(x).replace(",", ".") if isinstance(x, str) else x
+        )
+        df = df.replace({"": pd.NA}).dropna(how="all")
+
+        if stock_header not in df.columns:
             raise ValueError(
                 "Не найдена колонка с остатками (Остаток / Кол-во / Количество / Qty)"
             )
-        self.stock_column = col
+
+        self.stock_column = stock_header
+        self.df = df
         self.df[self.stock_column] = self.df[self.stock_column].astype(float)
         self.df["Цена"] = self.df["Цена"].astype(float)
 
@@ -250,8 +273,8 @@ class App:
             self.stock.load(path)
             self.stock_file = path
             self.gui_log(f"Остатки загружены: {len(self.stock.df)} строк")
-        except Exception as exc:
-            messagebox.showerror("Ошибка", str(exc))
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
 
     def load_invoice(self) -> None:
         path = filedialog.askopenfilename()
