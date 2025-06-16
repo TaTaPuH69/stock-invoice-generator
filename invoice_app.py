@@ -4,9 +4,6 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 from tkinter import Tk, filedialog, messagebox, Text, Scrollbar, Button, END
-import pandas as pd
-import logging
-import os
 # (остальные ваши импорты)
 
 # ─────── КАТАЛОГ ───────
@@ -114,6 +111,13 @@ class InvoiceProcessor:
         logging.info(f"Загружен счет на сумму {self.original_sum:.2f}")
 
 class InvoiceProcessor:
+    stock: StockManager
+    df: pd.DataFrame = field(default_factory=pd.DataFrame)
+    original_sum: float = 0.0
+    used_analogs: List[str] = field(default_factory=list)
+    result_rows: List[dict] = field(default_factory=list)
+    log: List[str] = field(default_factory=list)
+
     def process(self) -> None:
         """
         Проходит по строкам счёта и пытается зарезервировать позиции на складе.
