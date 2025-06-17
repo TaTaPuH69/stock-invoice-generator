@@ -333,7 +333,7 @@ class App:
 
         self.log_text = Text(self.root, height=20, width=90, font=("Consolas", 10))
         self.log_text.pack(side="left", fill="both", expand=True)
-        Scrollbar(self.root, command=self.log_text.yview).pack(
+        scroll_bar.config(command=log.yview_moveto).pack(
             side="right", fill="y"
         )
         self.log_text.configure(yscrollcommand=self.log_text.yview)
