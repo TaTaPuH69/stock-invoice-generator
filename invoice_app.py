@@ -40,7 +40,7 @@ def read_table(path: str) -> pd.DataFrame:
     _, ext = os.path.splitext(path)
 
     if ext.lower() in (".xls", ".xlsx"):
-        df = pd.read_excel(path, dtype=str, header=9)       # ← главное изменение
+        df = pd.read_excel(path, dtype=str, header=8)       # ← главное изменение
     else:
         df = pd.read_csv(path, dtype=str, sep=";")
 
