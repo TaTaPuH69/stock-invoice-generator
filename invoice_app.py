@@ -57,44 +57,37 @@ FIXED_STOCK_COL = 1   # B  → второй столбец ➜  index 1
 # ──────────────────────────────────────
 
 
-# ─── read_table (заменить целиком) ───
+# ─── read_table (берём 2-й столбец с 10-й строки) ───
 def read_table(path: str) -> pd.DataFrame:
     """
-    Читает Excel/CSV, начиная строго с координаты B10:
-        • пропускает первые 9 строк;
-        • берёт колонку index=1 как «Остаток»;
-        • все данные читаются как строковые.
+    Читает Excel / CSV-файл и возвращает DataFrame
+    ▸ Excel: пропускаем первые 9 строк (0-based => строка 10),
+      берём все данные без заголовка.
+    ▸ CSV: то же самое (skiprows=9, без header).
+    Оставляем два столбца: первый (артикул / наименование)
+    и второй — количество (переименуем в 'Остаток').
     """
     _, ext = os.path.splitext(path)
 
+    kw_args = dict(dtype=str, header=None, skiprows=9)
+
     if ext.lower() in (".xls", ".xlsx"):
-        df = pd.read_excel(
-            path,
-            dtype=str,
-            header=None,          # ← читаем БЕЗ заголовка
-            skiprows=FIXED_STOCK_ROW
-        )
-    else:                        # вдруг CSV
-        df = pd.read_csv(
-            path,
-            dtype=str,
-            sep=";",
-            header=None,
-            skiprows=FIXED_STOCK_ROW
-        )
+        df = pd.read_excel(path, **kw_args)
+    else:
+        df = pd.read_csv(path, sep=";", **kw_args)
 
-    # даём столбцу с остатками понятное имя
-    stock_col_name = "Количество"
-    df.rename(columns={FIXED_STOCK_COL: stock_col_name}, inplace=True)
+    # оставляем только первые два столбца
+    df = df.iloc[:, :2]
+    df.columns = ["Артикул", "Остаток"]      # как угодно, главное второй - количество
+    df["Остаток"] = df["Остаток"].astype(float)
 
-    # остальное — как раньше: меняем запятую на точку и т.д.
-    df.applymap(
-        lambda x: str(x).replace(",", ".") if isinstance(x, str) else x
-    )
-    df.replace({"": None}, inplace=True)
+    # заменяем запятую на точку в числах и убираем пустые строки
+    df.replace({",": "."}, regex=True, inplace=True)
+    df.dropna(how="all", inplace=True)
 
     return df
-# ──────────────────────────────────────
+# ─────────────────────────────────────────────────────
+
 
 
 # ─── StockManager.load (оставляем как есть) ───
