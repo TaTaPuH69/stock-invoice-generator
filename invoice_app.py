@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 import logging
 import re
+import unicodedata
+import pandas as pd
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -30,50 +32,80 @@ VAT_RATE = 0.20
 CATALOG_PATH = Path("profiles_catalog.xlsx")
 _catalog = pd.read_excel(CATALOG_PATH)
 
-# ─── util: найти строку-заголовок в Excel ───
-def _find_header_row(path: str, sample_rows: int = 20) -> int:
+
+# ---------- read_table ----------
+def read_table(path: str) -> pd.DataFrame:
     """
-    Просматривает первые `sample_rows` строк *Excel-файла* и возвращает индекс
-    (0-based) строки, где встречается одно из ключевых слов:
-        'количество', 'кол-во', 'qty', 'остаток'.
-    Если ничего не найдено – возвращает 7 (старое поведение).
+    Читаем Excel / CSV, сами ищем строку-заголовок
+    (ключевые слова: Остаток, Кол-во, Количество, Qty).
     """
-    import openpyxl                # ← понадобится; см. пункт 6
+    _, ext = os.path.splitext(path)
+    kw = {"остаток", "остатки", "количество", "кол-во", "qty"}
 
-    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    ws = wb.active
-    for idx, row in enumerate(ws.iter_rows(max_row=sample_rows, values_only=True)):
-        # превратим ячейки в одну строку текста, приведём к lower()
-        text_row = " | ".join(str(c).lower() for c in row if c)
-        if any(key in text_row
-               for key in ("количество", "кол-во", "qty", "остаток")):
-            return idx
-    return 7            # fallback: как было раньше
+    if ext.lower() in (".xls", ".xlsx"):
+        raw = pd.read_excel(path, header=None, dtype=str)
+
+        header_row = None
+        for i in range(min(25, len(raw))):          # смотрим чуть глубже
+            row = raw.iloc[i].fillna("")
+            row_norm = (
+                row.astype(str)
+                   .apply(_norm_cell)               # убираем «мусор»
+                   .str.lower()
+            )
+            if any(any(k in cell for k in kw) for cell in row_norm):
+                header_row = i
+                break
+
+        if header_row is None:
+            raise ValueError("В первых 25 строках не найден заголовок")
+
+        df = pd.read_excel(path, header=header_row, dtype=str)
+
+    else:
+        df = pd.read_csv(path, sep=";", dtype=str)
+
+    # печатаем список колонок для контроля
+    print(">>> Найденные колонки:", list(df.columns))
+
+    # базовая очистка
+    df = (
+        df.applymap(lambda x: str(x).replace(",", ".") if isinstance(x, str) else x)
+          .replace({"": pd.NA})
+          .dropna(how="all")
+    )
+    return df
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------- StockManager._detect_stock_column ----------
 def _detect_stock_column(self) -> str | None:
     """
-    Возвращает название колонки, где лежат остатки.
-
-    Считаем подходящими заголовки, содержащие (без учёта регистра
-    и пробелов): «остаток», «остатки», «колво», «количество», «qty».
+    Находим колонку остатков (ост, qty, кол-во …) — со всеми очищающими
+    танцами: удаляем невидимые символы, не-breaking-space, табы и т.п.
     """
     kw = {"остаток", "остатки", "колво", "количество", "qty"}
 
     for col in self.df.columns:
-        name = (
-            str(col)
-            .lower()
-            .replace(" ", "")     # убираем пробелы внутри
-            .replace("-", "")     # убираем дефисы («кол-во»)
-            .replace("ё", "е")    # «quantity» тут не причём, но на всякий :)
-        )
-        if any(k in name for k in kw):
+        cleaned = _norm_cell(str(col))
+        if any(k in cleaned for k in kw):
             return col
 
+    print("\n>>> Колонка не найдена. Что видел скрипт:", list(self.df.columns))
     return None
-# ──────────────────────────────────────────────────────────────────────────────
+
+
+# ---------- вспомогательная ----------
+def _norm_cell(text: str) -> str:
+    """
+    • приводит строку к NFC-форме (убирает скрытые акценты в кириллице)
+    • удаляет все символы категории «Zs» (прочие пробелы) и «Cc» (управляющие)
+    • убирает дефисы, подчёркивания, точки.
+    """
+    text = unicodedata.normalize("NFC", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) not in {"Zs", "Cc"})
+    text = re.sub(r"[-_.\s]", "", text)   # ещё раз на всякий
+    return text.lower()
+
 
 
 def find_analog(code: str, length: float) -> Optional[str]:
