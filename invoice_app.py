@@ -52,7 +52,7 @@ def _normalize(col: str) -> str:
     )
 
 # ─── настройка «жёстких» координат ───
-FIXED_STOCK_ROW = 9   # B10 → 10-я строка  ➜  index 9
+FIXED_STOCK_ROW = 8   # B10 → 10-я строка  ➜  index 9
 FIXED_STOCK_COL = 1   # B  → второй столбец ➜  index 1
 # ──────────────────────────────────────
 
