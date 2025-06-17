@@ -51,48 +51,56 @@ def _normalize(col: str) -> str:
         .replace("ё", "е")      # было
     )
 
-# ---------- read_table ----------
+# ─── настройка «жёстких» координат ───
+FIXED_STOCK_ROW = 9   # B10 → 10-я строка  ➜  index 9
+FIXED_STOCK_COL = 1   # B  → второй столбец ➜  index 1
+# ──────────────────────────────────────
+
+
+# ─── read_table (заменить целиком) ───
 def read_table(path: str) -> pd.DataFrame:
     """
-    Читаем Excel / CSV, сами ищем строку-заголовок
-    (ключевые слова: Остаток, Кол-во, Количество, Qty).
+    Читает Excel/CSV, начиная строго с координаты B10:
+        • пропускает первые 9 строк;
+        • берёт колонку index=1 как «Остаток»;
+        • все данные читаются как строковые.
     """
     _, ext = os.path.splitext(path)
-    kw = {"остаток", "остатки", "количество", "кол-во", "qty"}
 
     if ext.lower() in (".xls", ".xlsx"):
-        raw = pd.read_excel(path, header=None, dtype=str)
+        df = pd.read_excel(
+            path,
+            dtype=str,
+            header=None,          # ← читаем БЕЗ заголовка
+            skiprows=FIXED_STOCK_ROW
+        )
+    else:                        # вдруг CSV
+        df = pd.read_csv(
+            path,
+            dtype=str,
+            sep=";",
+            header=None,
+            skiprows=FIXED_STOCK_ROW
+        )
 
-        header_row = None
-        for i in range(min(25, len(raw))):          # смотрим чуть глубже
-            row = raw.iloc[i].fillna("")
-            row_norm = (
-                row.astype(str)
-                   .apply(_norm_cell)               # убираем «мусор»
-                   .str.lower()
-            )
-            if any(any(k in cell for k in kw) for cell in row_norm):
-                header_row = i
-                break
+    # даём столбцу с остатками понятное имя
+    stock_col_name = "Количество"
+    df.rename(columns={FIXED_STOCK_COL: stock_col_name}, inplace=True)
 
-        if header_row is None:
-            raise ValueError("В первых 25 строках не найден заголовок")
-
-        df = pd.read_excel(path, header=header_row, dtype=str)
-
-    else:
-        df = pd.read_csv(path, sep=";", dtype=str)
-
-    # печатаем список колонок для контроля
-    print(">>> Найденные колонки:", list(df.columns))
-
-    # базовая очистка
-    df = (
-        df.applymap(lambda x: str(x).replace(",", ".") if isinstance(x, str) else x)
-          .replace({"": pd.NA})
-          .dropna(how="all")
+    # остальное — как раньше: меняем запятую на точку и т.д.
+    df.applymap(
+        lambda x: str(x).replace(",", ".") if isinstance(x, str) else x
     )
+    df.replace({"": None}, inplace=True)
+
     return df
+# ──────────────────────────────────────
+
+
+# ─── StockManager.load (оставляем как есть) ───
+# в self.stock_column у вас уже будет строка "Остаток",
+# потому что read_table переименовал нужный столбец.
+
 
 
 # ---------- StockManager._detect_stock_column ----------
