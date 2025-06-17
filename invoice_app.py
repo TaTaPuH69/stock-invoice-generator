@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import logging
+import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -62,10 +63,27 @@ class StockManager:
     stock_column: str = "Остаток"
 
     def _detect_stock_column(self) -> Optional[str]:
-        variants = ["остаток", "кол-во", "количество", "qty"]
+        def normal(name: str) -> str:
+            name = name.lower().replace("ё", "е")
+            return re.sub(r"[\s\-_/,.]", "", name)
+
+        candidates = [
+            "остаток",
+            "остатки",
+            "колво",
+            "количество",
+            "qty",
+            "дебетколво",
+            "дебетколичество",
+            "debet",
+            "debetqty",
+            "debetkolvo",
+        ]
+
         for col in self.df.columns:
-            name = col.strip().lower()
-            if any(v in name for v in variants):
+            norm = normal(col)
+            logging.debug(f"Пробуем колонку '{col}' → '{norm}'")
+            if any(key in norm for key in candidates):
                 return col
         return None
 
