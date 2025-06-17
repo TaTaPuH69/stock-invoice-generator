@@ -61,22 +61,49 @@ class StockManager:
     df: pd.DataFrame = field(default_factory=pd.DataFrame)
     stock_column: str = "Остаток"
 
+    # ────────────────────────────────────────────────────────────
+    def _detect_stock_column(self) -> Optional[str]:
+        """
+        Возвращает название колонки, где лежат остатки.
+        Ищет слова «остаток», «остатки», «количество» (без регистра).
+        """
+        for col in self.df.columns:
+            name = col.strip().lower()
+            if any(key in name for key in ("остаток", "остатки", "количество")):
+                return col
+        return None
 
-    # ── service ───────────────────────────────────────────────────
-def _detect_stock_column(self) -> Optional[str]:
-    """Возвращает имя колонки с количеством на складе.
+    # ----------------------------------------------------------------
+    def load(self, path: str) -> None:
+        """
+        Читает Excel/CSV-файл, ищет колонку с остатками,
+        приводит типы и пишет всё в self.df.
+        """
+        # читаем таблицу (строка 8 — там у вас находятся реальные заголовки)
+        self.df = read_table(path)
 
-    Допустимые названия:
-        • Остаток
-        • Кол-во
-        • Количество
-        • Qty
-    """
-    allowed = {"остаток", "кол-во", "количество", "qty"}
-    for col in self.df.columns:
-        if col.strip().lower() in allowed:
-            return col
-    return None
+        # ищем колонку остатков
+        col = self._detect_stock_column()
+        if not col:
+            raise ValueError(
+                "Не найдена колонка с остатками. "
+                "Ожидаю заголовок, содержащий 'Остаток' или 'Количество'. "
+                f"Найдены: {', '.join(self.df.columns)}"
+            )
+        self.stock_column = col
+
+        # числовые типы
+        self.df[self.stock_column] = self.df[self.stock_column].astype(float)
+        if "Цена" in self.df.columns:
+            self.df["Цена"] = self.df["Цена"].astype(float)
+
+        # логируем дубликаты
+        dup = self.df[self.df.duplicated("Артикул")]
+        if not dup.empty:
+            logging.warning(f"Дубликаты в остатках: {dup['Артикул'].tolist()}")
+
+        logging.info(f"Остатки загружены: {len(self.df)} строк; колонка '{self.stock_column}'")
+    # ────────────────────────────────────────────────────────────
 
 
     # ── public API ────────────────────────────────────────────────
@@ -88,6 +115,7 @@ def _detect_stock_column(self) -> Optional[str]:
             raise ValueError(
                 "Не найдена колонка с остатками (Остаток / Кол-во / Количество / Qty)"
             )
+
         self.stock_column = col
         self.df[self.stock_column] = self.df[self.stock_column].astype(float)
         self.df["Цена"] = self.df["Цена"].astype(float)
