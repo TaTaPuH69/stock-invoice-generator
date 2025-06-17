@@ -32,6 +32,24 @@ VAT_RATE = 0.20
 CATALOG_PATH = Path("profiles_catalog.xlsx")
 _catalog = pd.read_excel(CATALOG_PATH)
 
+# ─── util: нормализуем имя колонки ───
+def _normalize(col: str) -> str:
+    """
+    Приводит заголовок столбца к унифицированному виду:
+    • lower()         – без регистра
+    • удаляем пробелы, «-», табы и переводы строк
+    • ё → е
+    """
+    return (
+        str(col)
+        .lower()
+        .replace("\n", "")      # NEW: убираем перевод строки
+        .replace("\r", "")      #         "
+        .replace("\t", "")      #         "
+        .replace(" ", "")       # было
+        .replace("-", "")       # было
+        .replace("ё", "е")      # было
+    )
 
 # ---------- read_table ----------
 def read_table(path: str) -> pd.DataFrame:
@@ -79,19 +97,15 @@ def read_table(path: str) -> pd.DataFrame:
 
 # ---------- StockManager._detect_stock_column ----------
 def _detect_stock_column(self) -> str | None:
-    """
-    Находим колонку остатков (ост, qty, кол-во …) — со всеми очищающими
-    танцами: удаляем невидимые символы, не-breaking-space, табы и т.п.
-    """
+    """Возвращает название колонки, содержащей остатки/кол-во."""
     kw = {"остаток", "остатки", "колво", "количество", "qty"}
 
     for col in self.df.columns:
-        cleaned = _norm_cell(str(col))
-        if any(k in cleaned for k in kw):
-            return col
+        name = _normalize(col)
+        if any(k in name for k in kw):
+            return col          # нашли подходящий столбец
 
-    print("\n>>> Колонка не найдена. Что видел скрипт:", list(self.df.columns))
-    return None
+    return None                 # ничего не подошло
 
 
 # ---------- вспомогательная ----------
