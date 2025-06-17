@@ -34,13 +34,13 @@ _catalog = pd.read_excel(CATALOG_PATH)
 def read_table(path: str) -> pd.DataFrame:
     """
     Читает Excel / CSV-файл и возвращает DataFrame
-    • header=7  →  пропустить первые 7 строк, взять заголовок из 8-й
-      (0-based нумерация: 0-7 пропускаем, 7-я строка – заголовок).
+    • header=8  →  пропустить первые 8 строк, взять заголовок из 9-й
+      (0-based нумерация: 0-8 пропускаем, 8-я строка – заголовок).
     """
     _, ext = os.path.splitext(path)
 
     if ext.lower() in (".xls", ".xlsx"):
-        df = pd.read_excel(path, dtype=str, header=7)       # ← главное изменение
+        df = pd.read_excel(path, dtype=str, header=9)       # ← главное изменение
     else:
         df = pd.read_csv(path, dtype=str, sep=";")
 
