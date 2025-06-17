@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import logging
+import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -105,6 +106,12 @@ class StockManager:
         logging.info(f"Остатки загружены: {len(self.df)} строк; колонка '{self.stock_column}'")
     # ────────────────────────────────────────────────────────────
 
+        for col in self.df.columns:
+            norm = normal(col)
+            logging.debug(f"Пробуем колонку '{col}' → '{norm}'")
+            if any(key in norm for key in candidates):
+                return col
+        return None
 
     # ── public API ────────────────────────────────────────────────
     def load(self, path: str) -> None:
