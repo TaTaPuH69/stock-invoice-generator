@@ -17,7 +17,6 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-import pandas as pd
 from tkinter import Tk, filedialog, messagebox, Text, Scrollbar, Button, END
 
 # ──────────────────────── глобальная настройка ───────────────────
@@ -201,9 +200,27 @@ class InvoiceProcessor:
 
     # ── загрузка счёта ────────────────────────────────────────────
     def load(self, path: str) -> None:
-        self.df = read_table(path)
-        self.df["Количество"] = self.df["Количество"].astype(float)
-        self.df["Цена"] = self.df["Цена"].astype(float)
+        """
+        Читает Excel-счёт, пропуская 8 строк шапки (skiprows=8) и
+        аккуратно приводит числовые данные.
+        """
+        # 1) читаем таблицу начиная с 9-й строки
+        self.df = pd.read_excel(path, skiprows=8, dtype=str)
+
+        # 2) убираем полностью пустые строки / столбцы
+        self.df.dropna(how="all", inplace=True)
+        self.df.dropna(axis=1, how="all", inplace=True)
+
+        # 3) переводим строки-числа в float, ошибки → NaN
+        self.df["Количество"] = pd.to_numeric(
+            self.df["Количество"], errors="coerce"
+        )
+        self.df["Цена"] = pd.to_numeric(self.df["Цена"], errors="coerce")
+
+        # 4) удаляем строки без количества
+        self.df.dropna(subset=["Количество"], inplace=True)
+
+        # 5) ↓↓↓ дальнейший (старый) код оставляем без изменений ↓↓↓
 
         dups = self.df[self.df.duplicated("Артикул")]
         if not dups.empty:
