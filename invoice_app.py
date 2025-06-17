@@ -30,6 +30,27 @@ VAT_RATE = 0.20
 CATALOG_PATH = Path("profiles_catalog.xlsx")
 _catalog = pd.read_excel(CATALOG_PATH)
 
+# ─── util: найти строку-заголовок в Excel ───
+def _find_header_row(path: str, sample_rows: int = 20) -> int:
+    """
+    Просматривает первые `sample_rows` строк *Excel-файла* и возвращает индекс
+    (0-based) строки, где встречается одно из ключевых слов:
+        'количество', 'кол-во', 'qty', 'остаток'.
+    Если ничего не найдено – возвращает 7 (старое поведение).
+    """
+    import openpyxl                # ← понадобится; см. пункт 6
+
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    ws = wb.active
+    for idx, row in enumerate(ws.iter_rows(max_row=sample_rows, values_only=True)):
+        # превратим ячейки в одну строку текста, приведём к lower()
+        text_row = " | ".join(str(c).lower() for c in row if c)
+        if any(key in text_row
+               for key in ("количество", "кол-во", "qty", "остаток")):
+            return idx
+    return 7            # fallback: как было раньше
+
+
 # ─── read_table ──────────────────────────────────────────────────────────────
 def read_table(path: str) -> pd.DataFrame:
     """
@@ -40,7 +61,7 @@ def read_table(path: str) -> pd.DataFrame:
     _, ext = os.path.splitext(path)
 
     if ext.lower() in (".xls", ".xlsx"):
-        df = pd.read_excel(path, dtype=str, header=8)       # ← главное изменение
+        header_row = _find_header_row(path)
     else:
         df = pd.read_csv(path, dtype=str, sep=";")
 
