@@ -141,72 +141,21 @@ class StockManager:
     stock_column: str = "Остаток"
 
     # ────────────────────────────────────────────────────────────
-    def _detect_stock_column(self) -> Optional[str]:
-        """
-        Пытается угадать колонку с количеством на складе.
-        Дополнительно к «остаток» поддерживает «дебет», «кол-во», «qty».
-        """
-        aliases = ("Количество", "остатки", "Дебет", "Остаток", "колво", "qty")
-        for col in self.df.columns:
-            name = col.strip().lower().replace("ё", "е")
-            if any(alias in name for alias in aliases):
-                return col
-        return None
-
-
-	# ─── StockManager.load ───
-	def load(self, path: str) -> None:
-    	"""
-    	Загружает Excel-файл остатков.
-
-    	• берём лист по-умолчанию;
-    	• пропускаем первые 9 строк  (индекс 0-based ⇒ skiprows=9);
-    	• берём только второй столбец  (index_col=1 или usecols="B");
-    	• колонку называем «Остаток» и приводим к float.
-    	"""
-    	# считаем только нужный диапазон: 2-й столбец, начиная с 10-й строки
-    	df = pd.read_excel(
-        	path,
-        	skiprows=9,          # пропускаем шапку до строки 10
-        	usecols="B",         # только столбец «B»
-        	header=None,         # заголовков в этой зоне нет
-        	names=["Остаток"],   # вручную задаём имя колонки
-        	dtype=float          # сразу как числа
-    	)
-
-    	# фиксируем результат
-    	self.df = df
-    	self.stock_column = "Остаток"   # теперь всегда знаем, как колонка называется
-    	logging.info(f"Загружено {len(df)} строк остатков")
-
-    # ────────────────────────────────────────────────────────────
-
-        for col in self.df.columns:
-            norm = normal(col)
-            logging.debug(f"Пробуем колонку '{col}' → '{norm}'")
-            if any(key in norm for key in candidates):
-                return col
-        return None
-
-    # ── public API ────────────────────────────────────────────────
     def load(self, path: str) -> None:
-        self.df = read_table(path)
-        col = self._detect_stock_column()
-        if not col:
+        """Загружает остатки без поиска заголовков.
 
-            raise ValueError(
-                "Не найдена колонка с остатками (Остаток / Кол-во / Количество / Qty)"
-            )
+        Значения берутся из столбца B начиная с десятой строки.
+        """
+        raw = pd.read_excel(path, header=None)
+        qty = raw.iloc[FIXED_STOCK_ROW:, FIXED_STOCK_COL]
+        articles = raw.iloc[FIXED_STOCK_ROW:, 0]
 
-        self.stock_column = col
-        self.df[self.stock_column] = self.df[self.stock_column].astype(float)
-        self.df["Цена"] = self.df["Цена"].astype(float)
+        self.df = pd.DataFrame({"Артикул": articles, "Остаток": qty})
+        self.df.dropna(how="all", inplace=True)
+        self.df.reset_index(drop=True, inplace=True)
 
-        dups = self.df[self.df.duplicated("Артикул")]
-        if not dups.empty:
-            logging.warning(f"Дубликаты в остатках: {dups['Артикул'].tolist()}")
-
-        logging.info(f"Загружено позиций на складе: {len(self.df)}")
+        self.stock_column = "Остаток"
+        logging.info(f"Загружено {len(self.df)} строк остатков")
 
     def allocate(self, article: str, qty: float) -> Optional[pd.Series]:
         rows = self.df[self.df["Артикул"] == article]
@@ -332,11 +281,10 @@ class App:
         self.root.title("Invoice Builder")
 
         self.log_text = Text(self.root, height=20, width=90, font=("Consolas", 10))
+        scroll_bar = Scrollbar(self.root, command=self.log_text.yview)
+        scroll_bar.pack(side="right", fill="y")
+        self.log_text.configure(yscrollcommand=scroll_bar.set)
         self.log_text.pack(side="left", fill="both", expand=True)
-        scroll_bar.config(command=log.yview_moveto).pack(
-            side="right", fill="y"
-        )
-        self.log_text.configure(yscrollcommand=self.log_text.yview)
 
         Button(self.root, text="Загрузить остатки", command=self.load_stock).pack()
         Button(self.root, text="Загрузить счёт", command=self.load_invoice).pack()
