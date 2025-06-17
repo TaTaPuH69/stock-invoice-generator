@@ -33,9 +33,9 @@ _catalog = pd.read_excel(CATALOG_PATH)
 def read_table(path: str) -> pd.DataFrame:
     _, ext = os.path.splitext(path)
     if ext.lower() in (".xls", ".xlsx"):
-        df = pd.read_excel(path, dtype=str)
+        df = pd.read_excel(path, dtype=str, header=7)
     else:
-        df = pd.read_csv(path, dtype=str, sep=";")
+        df = pd.read_csv(path, dtype=str, sep=";", header=7)
 
     # запятая → точка
     df = df.applymap(
@@ -61,27 +61,13 @@ class StockManager:
     df: pd.DataFrame = field(default_factory=pd.DataFrame)
     stock_column: str = "Остаток"
 
-    # ── service ───────────────────────────────────────────────────
-def _detect_stock_column(self) -> Optional[str]:
-    """
-    Возвращает имя колонки с количеством на складе.
-    Принимаются варианты:
-        • остаток / остатки
-        • saldo / остаток_колво
-        • сальдо ... количество
-    """
-    for col in self.df.columns:
-        name = col.strip().lower()
-
-        if (
-            "остаток" in name or
-            ("сальдо" in name and "колич" in name) or
-            ("debet" in name and "колич" in name) or
-            ("quantity" in name and "end" in name)          # на всякий случай
-        ):
-            return col
-    return None
-
+    def _detect_stock_column(self) -> Optional[str]:
+        variants = ["остаток", "кол-во", "количество", "qty"]
+        for col in self.df.columns:
+            name = col.strip().lower()
+            if any(v in name for v in variants):
+                return col
+        return None
 
     # ── public API ────────────────────────────────────────────────
     def load(self, path: str) -> None:
@@ -89,8 +75,9 @@ def _detect_stock_column(self) -> Optional[str]:
         col = self._detect_stock_column()
         if not col:
             raise ValueError(
-                "Не найдена колонка с остатками – ожидается столбец «Остаток»"
+                "Не найдена колонка с остатками (ищу 'Остаток' или синонимы)"
             )
+
         self.stock_column = col
         self.df[self.stock_column] = self.df[self.stock_column].astype(float)
         self.df["Цена"] = self.df["Цена"].astype(float)
@@ -255,8 +242,8 @@ class App:
             self.stock.load(path)
             self.stock_file = path
             self.gui_log(f"Остатки загружены: {len(self.stock.df)} строк")
-        except Exception as exc:
-            messagebox.showerror("Ошибка", str(exc))
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
 
     def load_invoice(self) -> None:
         path = filedialog.askopenfilename()
