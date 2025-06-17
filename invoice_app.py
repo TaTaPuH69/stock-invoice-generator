@@ -61,8 +61,12 @@ class StockManager:
     df: pd.DataFrame = field(default_factory=pd.DataFrame)
     stock_column: str = "Остаток"
 
-
-    # ── service ───────────────────────────────────────────────────
+        variants = ["остаток", "кол-во", "количество", "qty"]
+            name = col.strip().lower()
+            if any(v in name for v in variants):
+            raise ValueError(
+                "Не найдена колонка с остатками (Остаток / Кол-во / Количество / Qty)"
+            )
 def _detect_stock_column(self) -> Optional[str]:
     """Возвращает имя колонки с количеством на складе.
 
