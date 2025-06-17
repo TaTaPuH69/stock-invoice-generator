@@ -86,8 +86,10 @@ def _detect_stock_column(self) -> Optional[str]:
         if not col:
 
             raise ValueError(
+
                 "Не найдена колонка с остатками (Остаток / Кол-во / Количество / Qty)"
             )
+
         self.stock_column = col
         self.df[self.stock_column] = self.df[self.stock_column].astype(float)
         self.df["Цена"] = self.df["Цена"].astype(float)
