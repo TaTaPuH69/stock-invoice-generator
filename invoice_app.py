@@ -154,36 +154,31 @@ class StockManager:
         return None
 
 
-    # ----------------------------------------------------------------
-    def load(self, path: str) -> None:
-        """
-        Читает Excel/CSV-файл, ищет колонку с остатками,
-        приводит типы и пишет всё в self.df.
-        """
-        # читаем таблицу (строка 8 — там у вас находятся реальные заголовки)
-        self.df = read_table(path)
+	# ─── StockManager.load ───
+	def load(self, path: str) -> None:
+    	"""
+    	Загружает Excel-файл остатков.
 
-        # ищем колонку остатков
-        col = self._detect_stock_column()
-        if not col:
-            raise ValueError(
-                "Не найдена колонка с остатками. "
-                "Ожидаю заголовок, содержащий 'Количество' или 'Остаток'. "
-                f"Найдены: {', '.join(self.df.columns)}"
-            )
-        self.stock_column = col
+    	• берём лист по-умолчанию;
+    	• пропускаем первые 9 строк  (индекс 0-based ⇒ skiprows=9);
+    	• берём только второй столбец  (index_col=1 или usecols="B");
+    	• колонку называем «Остаток» и приводим к float.
+    	"""
+    	# считаем только нужный диапазон: 2-й столбец, начиная с 10-й строки
+    	df = pd.read_excel(
+        	path,
+        	skiprows=9,          # пропускаем шапку до строки 10
+        	usecols="B",         # только столбец «B»
+        	header=None,         # заголовков в этой зоне нет
+        	names=["Остаток"],   # вручную задаём имя колонки
+        	dtype=float          # сразу как числа
+    	)
 
-        # числовые типы
-        self.df[self.stock_column] = self.df[self.stock_column].astype(float)
-        if "Цена" in self.df.columns:
-            self.df["Цена"] = self.df["Цена"].astype(float)
+    	# фиксируем результат
+    	self.df = df
+    	self.stock_column = "Остаток"   # теперь всегда знаем, как колонка называется
+    	logging.info(f"Загружено {len(df)} строк остатков")
 
-        # логируем дубликаты
-        dup = self.df[self.df.duplicated("Артикул")]
-        if not dup.empty:
-            logging.warning(f"Дубликаты в остатках: {dup['Артикул'].tolist()}")
-
-        logging.info(f"Остатки загружены: {len(self.df)} строк; колонка '{self.stock_column}'")
     # ────────────────────────────────────────────────────────────
 
         for col in self.df.columns:
