@@ -51,26 +51,29 @@ def _find_header_row(path: str, sample_rows: int = 20) -> int:
     return 7            # fallback: как было раньше
 
 
-# ─── read_table ──────────────────────────────────────────────────────────────
-def read_table(path: str) -> pd.DataFrame:
+# ──────────────────────────────────────────────────────────────────────────────
+def _detect_stock_column(self) -> str | None:
     """
-    Читает Excel / CSV-файл и возвращает DataFrame
-    • header=8  →  пропустить первые 8 строк, взять заголовок из 9-й
-      (0-based нумерация: 0-8 пропускаем, 8-я строка – заголовок).
+    Возвращает название колонки, где лежат остатки.
+
+    Считаем подходящими заголовки, содержащие (без учёта регистра
+    и пробелов): «остаток», «остатки», «колво», «количество», «qty».
     """
-    _, ext = os.path.splitext(path)
+    kw = {"остаток", "остатки", "колво", "количество", "qty"}
 
-    if ext.lower() in (".xls", ".xlsx"):
-        header_row = _find_header_row(path)
-    else:
-        df = pd.read_csv(path, dtype=str, sep=";")
+    for col in self.df.columns:
+        name = (
+            str(col)
+            .lower()
+            .replace(" ", "")     # убираем пробелы внутри
+            .replace("-", "")     # убираем дефисы («кол-во»)
+            .replace("ё", "е")    # «quantity» тут не причём, но на всякий :)
+        )
+        if any(k in name for k in kw):
+            return col
 
-    # заменяем запятую на точку в числах, убираем полностью пустые строки/столбцы
-    df = df.applymap(lambda x: str(x).replace(",", ".") if isinstance(x, str) else x)
-    df = df.replace({"": pd.NA}).dropna(how="all")
-
-    return df
-# ─────────────────────────────────────────────────────────────────────────────
+    return None
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 def find_analog(code: str, length: float) -> Optional[str]:
