@@ -30,19 +30,26 @@ VAT_RATE = 0.20
 CATALOG_PATH = Path("profiles_catalog.xlsx")
 _catalog = pd.read_excel(CATALOG_PATH)
 
-# ──────────────────────────── helpers ────────────────────────────
+# ─── read_table ──────────────────────────────────────────────────────────────
 def read_table(path: str) -> pd.DataFrame:
+    """
+    Читает Excel / CSV-файл и возвращает DataFrame
+    • header=7  →  пропустить первые 7 строк, взять заголовок из 8-й
+      (0-based нумерация: 0-7 пропускаем, 7-я строка – заголовок).
+    """
     _, ext = os.path.splitext(path)
-    if ext.lower() in (".xls", ".xlsx"):
-        df = pd.read_excel(path, dtype=str, header=7)
-    else:
-        df = pd.read_csv(path, dtype=str, sep=";", header=7)
 
-    # запятая → точка
-    df = df.applymap(
-        lambda x: str(x).replace(",", ".") if isinstance(x, str) else x
-    )
-    return df.replace({"": pd.NA}).dropna(how="all")
+    if ext.lower() in (".xls", ".xlsx"):
+        df = pd.read_excel(path, dtype=str, header=7)       # ← главное изменение
+    else:
+        df = pd.read_csv(path, dtype=str, sep=";")
+
+    # заменяем запятую на точку в числах, убираем полностью пустые строки/столбцы
+    df = df.applymap(lambda x: str(x).replace(",", ".") if isinstance(x, str) else x)
+    df = df.replace({"": pd.NA}).dropna(how="all")
+
+    return df
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def find_analog(code: str, length: float) -> Optional[str]:
@@ -65,14 +72,16 @@ class StockManager:
     # ────────────────────────────────────────────────────────────
     def _detect_stock_column(self) -> Optional[str]:
         """
-        Возвращает название колонки, где лежат остатки.
-        Ищет слова «остаток», «остатки», «количество» (без регистра).
+        Пытается угадать колонку с количеством на складе.
+        Дополнительно к «остаток» поддерживает «дебет», «кол-во», «qty».
         """
+        aliases = ("Количество", "остатки", "Дебет", "Остаток", "колво", "qty")
         for col in self.df.columns:
-            name = col.strip().lower()
-            if any(key in name for key in ("остаток", "остатки", "количество")):
+            name = col.strip().lower().replace("ё", "е")
+            if any(alias in name for alias in aliases):
                 return col
         return None
+
 
     # ----------------------------------------------------------------
     def load(self, path: str) -> None:
@@ -88,7 +97,7 @@ class StockManager:
         if not col:
             raise ValueError(
                 "Не найдена колонка с остатками. "
-                "Ожидаю заголовок, содержащий 'Остаток' или 'Количество'. "
+                "Ожидаю заголовок, содержащий 'Количество' или 'Остаток'. "
                 f"Найдены: {', '.join(self.df.columns)}"
             )
         self.stock_column = col
