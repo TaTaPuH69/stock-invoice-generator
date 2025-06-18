@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import os
 import logging
+import re
+import unicodedata
+import pandas as pd
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -29,19 +32,95 @@ VAT_RATE = 0.20
 CATALOG_PATH = Path("profiles_catalog.xlsx")
 _catalog = pd.read_excel(CATALOG_PATH)
 
-# ──────────────────────────── helpers ────────────────────────────
-def read_table(path: str) -> pd.DataFrame:
-    _, ext = os.path.splitext(path)
-    if ext.lower() in (".xls", ".xlsx"):
-        df = pd.read_excel(path, dtype=str, header=7)
-    else:
-        df = pd.read_csv(path, dtype=str, sep=";", header=7)
-
-    # запятая → точка
-    df = df.applymap(
-        lambda x: str(x).replace(",", ".") if isinstance(x, str) else x
+# ─── util: нормализуем имя колонки ───
+def _normalize(col: str) -> str:
+    """
+    Приводит заголовок столбца к унифицированному виду:
+    • lower()         – без регистра
+    • удаляем пробелы, «-», табы и переводы строк
+    • ё → е
+    """
+    return (
+        str(col)
+        .lower()
+        .replace("\n", "")      # NEW: убираем перевод строки
+        .replace("\r", "")      #         "
+        .replace("\t", "")      #         "
+        .replace(" ", "")       # было
+        .replace("-", "")       # было
+        .replace("ё", "е")      # было
     )
-    return df.replace({"": pd.NA}).dropna(how="all")
+
+# ─── настройка «жёстких» координат ───
+FIXED_STOCK_ROW = 9   # B10 → 10-я строка  ➜  index 9
+FIXED_STOCK_COL = 1   # B  → второй столбец ➜  index 1
+# ──────────────────────────────────────
+
+
+# ─── read_table (берём 2-й столбец с 10-й строки) ───
+def read_table(path: str) -> pd.DataFrame:
+    """
+    Читает Excel / CSV-файл и возвращает DataFrame
+    ▸ Excel: пропускаем первые 9 строк (0-based => строка 10),
+      берём все данные без заголовка.
+    ▸ CSV: то же самое (skiprows=9, без header).
+    Оставляем два столбца: первый (артикул / наименование)
+    и второй — количество (переименуем в 'Остаток').
+    """
+    _, ext = os.path.splitext(path)
+
+    kw_args = dict(dtype=str, header=None, skiprows=9)
+
+    if ext.lower() in (".xls", ".xlsx"):
+        df = pd.read_excel(path, **kw_args)
+    else:
+        df = pd.read_csv(path, sep=";", **kw_args)
+
+    # оставляем только первые два столбца
+    df = df.iloc[:, :2]
+    df.columns = ["Артикул", "Остаток"]      # как угодно, главное второй - количество
+    df["Остаток"] = df["Остаток"].astype(float)
+
+    # заменяем запятую на точку в числах и убираем пустые строки
+    df.replace({",": "."}, regex=True, inplace=True)
+    df.dropna(how="all", inplace=True)
+
+    return df
+# ─────────────────────────────────────────────────────
+
+
+
+# ─── StockManager.load (оставляем как есть) ───
+# в self.stock_column у вас уже будет строка "Остаток",
+# потому что read_table переименовал нужный столбец.
+
+
+
+# ---------- StockManager._detect_stock_column ----------
+def _detect_stock_column(self) -> str | None:
+    """Возвращает название колонки, содержащей остатки/кол-во."""
+    kw = {"остаток", "остатки", "колво", "количество", "qty"}
+
+    for col in self.df.columns:
+        name = _normalize(col)
+        if any(k in name for k in kw):
+            return col          # нашли подходящий столбец
+
+    return None                 # ничего не подошло
+
+
+# ---------- вспомогательная ----------
+def _norm_cell(text: str) -> str:
+    """
+    • приводит строку к NFC-форме (убирает скрытые акценты в кириллице)
+    • удаляет все символы категории «Zs» (прочие пробелы) и «Cc» (управляющие)
+    • убирает дефисы, подчёркивания, точки.
+    """
+    text = unicodedata.normalize("NFC", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) not in {"Zs", "Cc"})
+    text = re.sub(r"[-_.\s]", "", text)   # ещё раз на всякий
+    return text.lower()
+
 
 
 def find_analog(code: str, length: float) -> Optional[str]:
@@ -61,32 +140,22 @@ class StockManager:
     df: pd.DataFrame = field(default_factory=pd.DataFrame)
     stock_column: str = "Остаток"
 
-    def _detect_stock_column(self) -> Optional[str]:
-        variants = ["остаток", "кол-во", "количество", "qty"]
-        for col in self.df.columns:
-            name = col.strip().lower()
-            if any(v in name for v in variants):
-                return col
-        return None
-
-    # ── public API ────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────
     def load(self, path: str) -> None:
-        self.df = read_table(path)
-        col = self._detect_stock_column()
-        if not col:
-            raise ValueError(
-                "Не найдена колонка с остатками (ищу 'Остаток' или синонимы)"
-            )
+        """Загружает остатки без поиска заголовков.
 
-        self.stock_column = col
-        self.df[self.stock_column] = self.df[self.stock_column].astype(float)
-        self.df["Цена"] = self.df["Цена"].astype(float)
+        Значения берутся из столбца B начиная с десятой строки.
+        """
+        raw = pd.read_excel(path, header=None)
+        qty = raw.iloc[FIXED_STOCK_ROW:, FIXED_STOCK_COL]
+        articles = raw.iloc[FIXED_STOCK_ROW:, 0]
 
-        dups = self.df[self.df.duplicated("Артикул")]
-        if not dups.empty:
-            logging.warning(f"Дубликаты в остатках: {dups['Артикул'].tolist()}")
+        self.df = pd.DataFrame({"Артикул": articles, "Остаток": qty})
+        self.df.dropna(how="all", inplace=True)
+        self.df.reset_index(drop=True, inplace=True)
 
-        logging.info(f"Загружено позиций на складе: {len(self.df)}")
+        self.stock_column = "Остаток"
+        logging.info(f"Загружено {len(self.df)} строк остатков")
 
     def allocate(self, article: str, qty: float) -> Optional[pd.Series]:
         rows = self.df[self.df["Артикул"] == article]
@@ -212,11 +281,10 @@ class App:
         self.root.title("Invoice Builder")
 
         self.log_text = Text(self.root, height=20, width=90, font=("Consolas", 10))
+        scroll_bar = Scrollbar(self.root, command=self.log_text.yview)
+        scroll_bar.pack(side="right", fill="y")
+        self.log_text.configure(yscrollcommand=scroll_bar.set)
         self.log_text.pack(side="left", fill="both", expand=True)
-        Scrollbar(self.root, command=self.log_text.yview).pack(
-            side="right", fill="y"
-        )
-        self.log_text.configure(yscrollcommand=self.log_text.yview)
 
         Button(self.root, text="Загрузить остатки", command=self.load_stock).pack()
         Button(self.root, text="Загрузить счёт", command=self.load_invoice).pack()
