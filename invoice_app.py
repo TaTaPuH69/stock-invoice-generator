@@ -200,34 +200,55 @@ class InvoiceProcessor:
 
     # ── загрузка счёта ────────────────────────────────────────────
     def load(self, path: str) -> None:
-        """
-        Читает Excel-счёт, пропуская 8 строк шапки (skiprows=8) и
-        аккуратно приводит числовые данные.
-        """
-        # 1) читаем таблицу начиная с 9-й строки
-        self.df = pd.read_excel(path, skiprows=8, dtype=str)
+        """Загружает счёт, учитывая заголовки в строке 16."""
+        try:
+            df = (
+                pd.read_excel(
+                    path,
+                    skiprows=15,
+                    header=0,
+                    usecols="C,D,F",
+                    dtype=str,
+                ).rename(columns={"Код": "Артикул"})
+            )
+        except ValueError:
+            df = (
+                pd.read_excel(
+                    path,
+                    skiprows=15,
+                    header=0,
+                    usecols="C,D",
+                    dtype=str,
+                ).rename(columns={"Код": "Артикул"})
+            )
 
-        # 2) убираем полностью пустые строки / столбцы
-        self.df.dropna(how="all", inplace=True)
-        self.df.dropna(axis=1, how="all", inplace=True)
+        if "Цена" not in df.columns:
+            df["Цена"] = pd.NA
 
-        # 3) переводим строки-числа в float, ошибки → NaN
-        self.df["Количество"] = pd.to_numeric(
-            self.df["Количество"], errors="coerce"
-        )
-        self.df["Цена"] = pd.to_numeric(self.df["Цена"], errors="coerce")
+        df.dropna(how="all", inplace=True)
 
-        # 4) удаляем строки без количества
-        self.df.dropna(subset=["Количество"], inplace=True)
+        df["Количество"] = pd.to_numeric(df["Количество"], errors="coerce")
+        df["Цена"] = pd.to_numeric(df["Цена"], errors="coerce")
+        df.dropna(subset=["Количество"], inplace=True)
 
-        # 5) ↓↓↓ дальнейший (старый) код оставляем без изменений ↓↓↓
+        self.df = df
+
+        # ↓↓↓ дальнейший (старый) код оставляем без изменений ↓↓↓
 
         dups = self.df[self.df.duplicated("Артикул")]
         if not dups.empty:
             logging.warning(f"Дубликаты в счёте: {dups['Артикул'].tolist()}")
 
-        self.original_sum = (self.df["Количество"] * self.df["Цена"]).sum()
-        logging.info(f"Загружен счёт на {self.original_sum:,.2f} ₽")
+        if self.df["Цена"].notna().any():
+            self.original_sum = (
+                self.df["Количество"] * self.df["Цена"]
+            ).sum()
+            logging.info(
+                f"Загружен счёт на {self.original_sum:,.2f} ₽"
+            )
+        else:
+            self.original_sum = 0.0
+            logging.info("Загружен счёт без цен")
 
     # ── основная логика ───────────────────────────────────────────
     def process(self) -> None:
