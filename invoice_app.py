@@ -232,7 +232,6 @@ class InvoiceProcessor:
         df.dropna(subset=["Количество"], inplace=True)
 
         self.df = df
-
         # ↓↓↓ дальнейший (старый) код оставляем без изменений ↓↓↓
 
         dups = self.df[self.df.duplicated("Артикул")]
