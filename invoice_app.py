@@ -200,46 +200,54 @@ class InvoiceProcessor:
 
     # ── загрузка счёта ────────────────────────────────────────────
     def load(self, path: str) -> None:
-        """Загружает Excel-счёт, начиная с 10-й строки."""
+        """Загружает счёт, учитывая заголовки в строке 16."""
         try:
-            df = pd.read_excel(
-                path,
-                skiprows=9,
-                usecols="A,B,D",
-                header=None,
-                dtype=str,
+            df = (
+                pd.read_excel(
+                    path,
+                    skiprows=15,
+                    header=0,
+                    usecols="C,D,F",
+                    dtype=str,
+                ).rename(columns={"Код": "Артикул"})
             )
         except ValueError:
-            df = pd.read_excel(
-                path,
-                skiprows=9,
-                usecols="A,B",
-                header=None,
-                dtype=str,
+            df = (
+                pd.read_excel(
+                    path,
+                    skiprows=15,
+                    header=0,
+                    usecols="C,D",
+                    dtype=str,
+                ).rename(columns={"Код": "Артикул"})
             )
-        if df.shape[1] == 2:
-            df.columns = ["Артикул", "Количество"]
+
+        if "Цена" not in df.columns:
             df["Цена"] = pd.NA
-        else:
-            df.columns = ["Артикул", "Количество", "Цена"]
 
         df.dropna(how="all", inplace=True)
-        df.dropna(axis=1, how="all", inplace=True)
 
         df["Количество"] = pd.to_numeric(df["Количество"], errors="coerce")
-        df["Цена"] = pd.to_numeric(df["Цена"], errors="coerce")
+        df["Цена"] = pd.to_numeric(df.get("Цена"), errors="coerce")
         df.dropna(subset=["Количество"], inplace=True)
 
         self.df = df
-
         # ↓↓↓ дальнейший (старый) код оставляем без изменений ↓↓↓
 
         dups = self.df[self.df.duplicated("Артикул")]
         if not dups.empty:
             logging.warning(f"Дубликаты в счёте: {dups['Артикул'].tolist()}")
 
-        self.original_sum = (self.df["Количество"] * self.df["Цена"]).sum()
-        logging.info(f"Загружен счёт на {self.original_sum:,.2f} ₽")
+        if self.df["Цена"].notna().any():
+            self.original_sum = (
+                self.df["Количество"] * self.df["Цена"]
+            ).sum()
+            logging.info(
+                f"Загружен счёт на {self.original_sum:,.2f} ₽"
+            )
+        else:
+            self.original_sum = 0.0
+            logging.info("Загружен счёт без цен")
 
     # ── основная логика ───────────────────────────────────────────
     def process(self) -> None:
