@@ -200,23 +200,24 @@ class InvoiceProcessor:
 
     # ── загрузка счёта ────────────────────────────────────────────
     def load(self, path: str) -> None:
-        """Загружает Excel-счёт, начиная с 10-й строки."""
+        """Загружает Excel-счёт, начиная с 17-й строки."""
         try:
             df = pd.read_excel(
                 path,
-                skiprows=9,
-                usecols="A,B,D",
+                skiprows=16,
+                usecols="C,D,F",
                 header=None,
                 dtype=str,
             )
         except ValueError:
             df = pd.read_excel(
                 path,
-                skiprows=9,
-                usecols="A,B",
+                skiprows=16,
+                usecols="C,D",
                 header=None,
                 dtype=str,
             )
+
         if df.shape[1] == 2:
             df.columns = ["Артикул", "Количество"]
             df["Цена"] = pd.NA
@@ -224,10 +225,9 @@ class InvoiceProcessor:
             df.columns = ["Артикул", "Количество", "Цена"]
 
         df.dropna(how="all", inplace=True)
-        df.dropna(axis=1, how="all", inplace=True)
 
         df["Количество"] = pd.to_numeric(df["Количество"], errors="coerce")
-        df["Цена"] = pd.to_numeric(df["Цена"], errors="coerce")
+        df["Цена"] = pd.to_numeric(df.get("Цена"), errors="coerce")
         df.dropna(subset=["Количество"], inplace=True)
 
         self.df = df
@@ -238,8 +238,16 @@ class InvoiceProcessor:
         if not dups.empty:
             logging.warning(f"Дубликаты в счёте: {dups['Артикул'].tolist()}")
 
-        self.original_sum = (self.df["Количество"] * self.df["Цена"]).sum()
-        logging.info(f"Загружен счёт на {self.original_sum:,.2f} ₽")
+        if self.df["Цена"].notna().any():
+            self.original_sum = (
+                self.df["Количество"] * self.df["Цена"]
+            ).sum()
+            logging.info(
+                f"Загружен счёт на {self.original_sum:,.2f} ₽"
+            )
+        else:
+            self.original_sum = 0.0
+            logging.info("Загружен счёт без цен")
 
     # ── основная логика ───────────────────────────────────────────
     def process(self) -> None:
