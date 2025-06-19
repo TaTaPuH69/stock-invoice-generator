@@ -200,27 +200,39 @@ class InvoiceProcessor:
 
     # ── загрузка счёта ────────────────────────────────────────────
     def load(self, path: str) -> None:
-        """
-        Читает Excel-счёт, пропуская 8 строк шапки (skiprows=8) и
-        аккуратно приводит числовые данные.
-        """
-        # 1) читаем таблицу начиная с 9-й строки
-        self.df = pd.read_excel(path, skiprows=8, dtype=str)
+        """Загружает Excel-счёт, начиная с 10-й строки."""
+        try:
+            df = pd.read_excel(
+                path,
+                skiprows=9,
+                usecols="A,B,D",
+                header=None,
+                dtype=str,
+            )
+        except ValueError:
+            df = pd.read_excel(
+                path,
+                skiprows=9,
+                usecols="A,B",
+                header=None,
+                dtype=str,
+            )
+        if df.shape[1] == 2:
+            df.columns = ["Артикул", "Количество"]
+            df["Цена"] = pd.NA
+        else:
+            df.columns = ["Артикул", "Количество", "Цена"]
 
-        # 2) убираем полностью пустые строки / столбцы
-        self.df.dropna(how="all", inplace=True)
-        self.df.dropna(axis=1, how="all", inplace=True)
+        df.dropna(how="all", inplace=True)
+        df.dropna(axis=1, how="all", inplace=True)
 
-        # 3) переводим строки-числа в float, ошибки → NaN
-        self.df["Количество"] = pd.to_numeric(
-            self.df["Количество"], errors="coerce"
-        )
-        self.df["Цена"] = pd.to_numeric(self.df["Цена"], errors="coerce")
+        df["Количество"] = pd.to_numeric(df["Количество"], errors="coerce")
+        df["Цена"] = pd.to_numeric(df["Цена"], errors="coerce")
+        df.dropna(subset=["Количество"], inplace=True)
 
-        # 4) удаляем строки без количества
-        self.df.dropna(subset=["Количество"], inplace=True)
+        self.df = df
 
-        # 5) ↓↓↓ дальнейший (старый) код оставляем без изменений ↓↓↓
+        # ↓↓↓ дальнейший (старый) код оставляем без изменений ↓↓↓
 
         dups = self.df[self.df.duplicated("Артикул")]
         if not dups.empty:
