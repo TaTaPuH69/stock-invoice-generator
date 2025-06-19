@@ -228,7 +228,7 @@ class InvoiceProcessor:
         df.dropna(how="all", inplace=True)
 
         df["Количество"] = pd.to_numeric(df["Количество"], errors="coerce")
-        df["Цена"] = pd.to_numeric(df["Цена"], errors="coerce")
+        df["Цена"] = pd.to_numeric(df.get("Цена"), errors="coerce")
         df.dropna(subset=["Количество"], inplace=True)
 
         self.df = df
