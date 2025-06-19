@@ -200,29 +200,30 @@ class InvoiceProcessor:
 
     # ── загрузка счёта ────────────────────────────────────────────
     def load(self, path: str) -> None:
-        """Загружает Excel-счёт, начиная с 17-й строки."""
+        """Загружает счёт, учитывая заголовки в строке 16."""
         try:
-            df = pd.read_excel(
-                path,
-                skiprows=16,
-                usecols="C,D,F",
-                header=None,
-                dtype=str,
+            df = (
+                pd.read_excel(
+                    path,
+                    skiprows=15,
+                    header=0,
+                    usecols="C,D,F",
+                    dtype=str,
+                ).rename(columns={"Код": "Артикул"})
             )
         except ValueError:
-            df = pd.read_excel(
-                path,
-                skiprows=16,
-                usecols="C,D",
-                header=None,
-                dtype=str,
+            df = (
+                pd.read_excel(
+                    path,
+                    skiprows=15,
+                    header=0,
+                    usecols="C,D",
+                    dtype=str,
+                ).rename(columns={"Код": "Артикул"})
             )
 
-        if df.shape[1] == 2:
-            df.columns = ["Артикул", "Количество"]
+        if "Цена" not in df.columns:
             df["Цена"] = pd.NA
-        else:
-            df.columns = ["Артикул", "Количество", "Цена"]
 
         df.dropna(how="all", inplace=True)
 
@@ -231,7 +232,6 @@ class InvoiceProcessor:
         df.dropna(subset=["Количество"], inplace=True)
 
         self.df = df
-
         # ↓↓↓ дальнейший (старый) код оставляем без изменений ↓↓↓
 
         dups = self.df[self.df.duplicated("Артикул")]
