@@ -323,7 +323,13 @@ class InvoiceProcessor:
         df = self.to_dataframe()
         total = df["Сумма"].sum()
         vat = df["НДС"].sum()
-        df.loc[len(df.index)] = ["Итого", "", "", total, vat]
+        tot_row = {col: "" for col in df.columns}
+        tot_row.update({
+            "Артикул": "Итого",
+            "Сумма": round(total, 2),
+            "НДС": round(vat, 2),
+        })
+        df.loc[len(df.index)] = tot_row
         df.to_excel(path, index=False)
         logging.info(f"Счёт сохранён в {path}")
 
