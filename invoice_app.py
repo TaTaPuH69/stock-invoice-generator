@@ -50,6 +50,18 @@ def _normalize(col: str) -> str:
         .replace("ё", "е")      # было
     )
 
+# ── поиск строки с заголовками в счёте ───────────────────────────
+def _find_header_row(path: str, max_row: int = 40) -> int:
+    """Возвращает индекс строки с заголовками таблицы счёта."""
+    for i in range(max_row):
+        row = pd.read_excel(path, skiprows=i, nrows=1, header=None).fillna("")
+        cells = [_normalize(str(c)) for c in row.values.ravel()]
+        has_code = any(c.startswith(("код", "артикул")) for c in cells)
+        has_qty = any(c.startswith("количест") or c.startswith("колво") or c.startswith("qty") for c in cells)
+        if has_code and has_qty:
+            return i
+    raise ValueError("Header row not found")
+
 # ─── настройка «жёстких» координат ───
 FIXED_STOCK_ROW = 9   # B10 → 10-я строка  ➜  index 9
 FIXED_STOCK_COL = 1   # B  → второй столбец ➜  index 1
@@ -156,6 +168,10 @@ class StockManager:
         self.stock_column = "Остаток"
         logging.info(f"Загружено {len(self.df)} строк остатков")
 
+        for col in ["Категория", "Цвет", "Покрытие", "Ширина"]:
+            if col not in self.df.columns:
+                self.df[col] = pd.NA
+
     def allocate(self, article: str, qty: float) -> Optional[pd.Series]:
         rows = self.df[self.df["Артикул"] == article]
         if not rows.empty:
@@ -173,17 +189,21 @@ class StockManager:
         width: float,
         used: List[str],
     ) -> Optional[pd.Series]:
-        cand = self.df[
-            (self.df["Категория"] == category)
-            & (self.df["Цвет"] == color)
-            & (self.df["Покрытие"] == coating)
+        def _safe_eq(df: pd.DataFrame, col: str, val: str):
+            if col not in df.columns or val in ("", pd.NA, None):
+                return pd.Series(True, index=df.index)
+            return df[col] == val
+
+        mask = (
+            _safe_eq(self.df, "Категория", category)
+            & _safe_eq(self.df, "Цвет", color)
+            & _safe_eq(self.df, "Покрытие", coating)
             & (~self.df["Артикул"].isin(used))
             & (self.df[self.stock_column] > 0)
-        ]
-        if "Ширина" in cand.columns:
-            cand = cand[
-                abs(cand["Ширина"].astype(float) - width) <= 10
-            ]
+        )
+        cand = self.df[mask]
+        if "Ширина" in self.df.columns and width:
+            cand = cand[abs(cand["Ширина"].astype(float) - width) <= 10]
         return None if cand.empty else cand.iloc[0]
 
 
@@ -200,34 +220,51 @@ class InvoiceProcessor:
 
     # ── загрузка счёта ────────────────────────────────────────────
     def load(self, path: str) -> None:
-        """
-        Читает Excel-счёт, пропуская 8 строк шапки (skiprows=8) и
-        аккуратно приводит числовые данные.
-        """
-        # 1) читаем таблицу начиная с 9-й строки
-        self.df = pd.read_excel(path, skiprows=8, dtype=str)
+        """Загружает счёт, автоматически определяя строку заголовка."""
+        hdr = _find_header_row(path)
+        df = pd.read_excel(path, skiprows=hdr, header=0, dtype=str)
 
-        # 2) убираем полностью пустые строки / столбцы
-        self.df.dropna(how="all", inplace=True)
-        self.df.dropna(axis=1, how="all", inplace=True)
+        rename_map: dict[str, str] = {}
+        for col in df.columns:
+            norm = _normalize(col)
+            if norm.startswith(("код", "артикул")):
+                rename_map[col] = "Артикул"
+            elif norm.startswith(("количест", "колво", "qty")):
+                rename_map[col] = "Количество"
+            elif norm.startswith(("цена", "стоимость", "price")):
+                rename_map[col] = "Цена"
 
-        # 3) переводим строки-числа в float, ошибки → NaN
-        self.df["Количество"] = pd.to_numeric(
-            self.df["Количество"], errors="coerce"
-        )
-        self.df["Цена"] = pd.to_numeric(self.df["Цена"], errors="coerce")
+        df.rename(columns=rename_map, inplace=True)
 
-        # 4) удаляем строки без количества
-        self.df.dropna(subset=["Количество"], inplace=True)
+        if "Цена" not in df.columns:
+            df["Цена"] = pd.NA
 
-        # 5) ↓↓↓ дальнейший (старый) код оставляем без изменений ↓↓↓
+        df = df.loc[:, [c for c in ["Артикул", "Количество", "Цена"] if c in df.columns]]
+        df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
+        df.dropna(how="all", inplace=True)
+
+        df["Количество"] = pd.to_numeric(df["Количество"], errors="coerce")
+        df["Цена"] = pd.to_numeric(df["Цена"], errors="coerce")
+        df.dropna(subset=["Количество"], inplace=True)
+
+        self.df = df
+
+        # ↓↓↓ дальнейший (старый) код оставляем без изменений ↓↓↓
 
         dups = self.df[self.df.duplicated("Артикул")]
         if not dups.empty:
             logging.warning(f"Дубликаты в счёте: {dups['Артикул'].tolist()}")
 
-        self.original_sum = (self.df["Количество"] * self.df["Цена"]).sum()
-        logging.info(f"Загружен счёт на {self.original_sum:,.2f} ₽")
+        if self.df["Цена"].notna().any():
+            self.original_sum = (
+                self.df["Количество"] * self.df["Цена"]
+            ).sum()
+            logging.info(
+                f"Загружен счёт на {self.original_sum:,.2f} ₽"
+            )
+        else:
+            self.original_sum = 0.0
+            logging.info("Загружен счёт без цен")
 
     # ── основная логика ───────────────────────────────────────────
     def process(self) -> None:
