@@ -168,6 +168,10 @@ class StockManager:
         self.stock_column = "Остаток"
         logging.info(f"Загружено {len(self.df)} строк остатков")
 
+        for col in ["Категория", "Цвет", "Покрытие", "Ширина"]:
+            if col not in self.df.columns:
+                self.df[col] = pd.NA
+
     def allocate(self, article: str, qty: float) -> Optional[pd.Series]:
         rows = self.df[self.df["Артикул"] == article]
         if not rows.empty:
@@ -185,17 +189,21 @@ class StockManager:
         width: float,
         used: List[str],
     ) -> Optional[pd.Series]:
-        cand = self.df[
-            (self.df["Категория"] == category)
-            & (self.df["Цвет"] == color)
-            & (self.df["Покрытие"] == coating)
+        def _safe_eq(df: pd.DataFrame, col: str, val: str):
+            if col not in df.columns or val in ("", pd.NA, None):
+                return pd.Series(True, index=df.index)
+            return df[col] == val
+
+        mask = (
+            _safe_eq(self.df, "Категория", category)
+            & _safe_eq(self.df, "Цвет", color)
+            & _safe_eq(self.df, "Покрытие", coating)
             & (~self.df["Артикул"].isin(used))
             & (self.df[self.stock_column] > 0)
-        ]
-        if "Ширина" in cand.columns:
-            cand = cand[
-                abs(cand["Ширина"].astype(float) - width) <= 10
-            ]
+        )
+        cand = self.df[mask]
+        if "Ширина" in self.df.columns and width:
+            cand = cand[abs(cand["Ширина"].astype(float) - width) <= 10]
         return None if cand.empty else cand.iloc[0]
 
 
