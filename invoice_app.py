@@ -181,29 +181,45 @@ class StockManager:
                 return row
         return None
 
+    def allocate_partial(self, article: str, qty: float) -> float:
+        """Списывает доступное количество и возвращает остаток."""
+        rows = self.df[self.df["Артикул"] == article]
+        if rows.empty:
+            return qty
+        row = rows.iloc[0]
+        avail = row[self.stock_column]
+        take = min(avail, qty)
+        if take > 0:
+            self.df.at[row.name, self.stock_column] -= take
+        return qty - take
+
     def find_analog(
         self,
-        category: str,
+        family: str,
+        length: float,
         color: str,
         coating: str,
         width: float,
         used: List[str],
+        price_rub: float,
     ) -> Optional[pd.Series]:
-        def _safe_eq(df: pd.DataFrame, col: str, val: str):
-            if col not in df.columns or val in ("", pd.NA, None):
-                return pd.Series(True, index=df.index)
-            return df[col] == val
+        if "Семейство" not in self.df.columns:
+            return None
 
-        mask = (
-            _safe_eq(self.df, "Категория", category)
-            & _safe_eq(self.df, "Цвет", color)
-            & _safe_eq(self.df, "Покрытие", coating)
-            & (~self.df["Артикул"].isin(used))
+        cand = self.df[
+            (self.df["Семейство"] == family)
             & (self.df[self.stock_column] > 0)
-        )
-        cand = self.df[mask]
-        if "Ширина" in self.df.columns and width:
-            cand = cand[abs(cand["Ширина"].astype(float) - width) <= 10]
+            & (~self.df["Артикул"].isin(used))
+        ]
+        if "Длина, м" in cand.columns:
+            cand = cand[abs(cand["Длина, м"].astype(float) - length) <= 0.05]
+        if color and "Цвет" in cand.columns:
+            same = cand[cand["Цвет"] == color]
+            cand = same if not same.empty else cand
+        if "price_rub" in cand.columns:
+            cand = cand.sort_values(
+                "price_rub", key=lambda s: abs(s - price_rub)
+            )
         return None if cand.empty else cand.iloc[0]
 
 
@@ -273,63 +289,75 @@ class InvoiceProcessor:
 
         for _, row in self.df.iterrows():
             art = row["Артикул"]
-            length_m = row.get("Длина, м", 0)
+            need = row["Количество"]
 
-            analog_code = find_analog(art, length_m)
-            art_to_use = analog_code or art
-            comment = f"замена на {analog_code}" if analog_code else ""
+            left = self.stock.allocate_partial(art, need)
+            if left < need:
+                self.result_rows.append(
+                    {
+                        "Артикул": art,
+                        "Количество": round(need - left, 2),
+                        "Цена": round(row["Цена"], 2),
+                        "Замена": "",
+                    }
+                )
 
-            qty = row["Количество"]
-            price = row["Цена"]
-
-            stock_row = self.stock.allocate(art_to_use, qty)
-            self.result_rows.append(
-                dict(Артикул=art_to_use, Количество=qty, Цена=price, Замена=comment)
-            )
-            if stock_row is not None:
-                continue  # всё зарезервировали
-
-            analog = self.stock.find_analog(
-                row.get("Категория", ""),
-                row.get("Цвет", ""),
-                row.get("Покрытие", ""),
-                row.get("Ширина", 0),
-                self.used_analogs,
-            )
-            if analog is None or analog[self.stock.stock_column] < qty:
-                msg = f"Не удалось найти {art} в нужном количестве"
-                self.log.append(msg)
-                logging.error(msg)
+            if left == 0:
                 continue
 
-            # списываем аналог
-            self.stock.df.at[analog.name, self.stock.stock_column] -= qty
-            self.used_analogs.append(art)
+            analog = self.stock.find_analog(
+                family=row.get("Семейство", ""),
+                length=row.get("Длина, м", 0),
+                color=row.get("Цвет", ""),
+                coating=row.get("Покрытие", ""),
+                width=row.get("Ширина", 0),
+                used=self.used_analogs,
+                price_rub=row.get("Цена", 0),
+            )
+            if analog is None or analog[self.stock.stock_column] < left:
+                self.log.append(f"Не удалось найти {art} в нужном количестве")
+                continue
 
-            last = self.result_rows[-1]
-            last["Артикул"] = analog["Артикул"]
-            last["Замена"] = f"замена на {analog['Артикул']}"
-            self.log.append(f"{art} заменён на {analog['Артикул']}")
+            self.stock.allocate_partial(analog["Артикул"], left)
+            self.used_analogs.append(analog["Артикул"])
+            self.result_rows.append(
+                {
+                    "Артикул": analog["Артикул"],
+                    "Количество": round(left, 2),
+                    "Цена": round(analog["price_rub"], 2),
+                    "Замена": f"аналог {art}",
+                }
+            )
+            self.log.append(f"{art}: {left} шт заменены на {analog['Артикул']}")
 
     # ── вывод ─────────────────────────────────────────────────────
     def to_dataframe(self) -> pd.DataFrame:
         df = pd.DataFrame(self.result_rows)
-        df["Сумма"] = df["Количество"] * df["Цена"]
-        df["НДС"] = df["Сумма"] - df["Сумма"] / (1 + VAT_RATE)
+        for col in ["Количество", "Цена"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
+        df["Сумма"] = (df["Количество"] * df["Цена"]).round(2)
+        df["НДС"] = (df["Сумма"] - df["Сумма"] / (1 + VAT_RATE)).round(2)
         return df
 
     def save(self, path: str) -> None:
-        df = self.to_dataframe()
-        total = df["Сумма"].sum()
-        vat = df["НДС"].sum()
-        tot_row = {col: "" for col in df.columns}
-        tot_row.update({
-            "Артикул": "Итого",
-            "Сумма": round(total, 2),
-            "НДС": round(vat, 2),
-        })
-        df.loc[len(df.index)] = tot_row
-        df.to_excel(path, index=False)
+        hdr_row = _find_header_row(self.invoice_file)
+        df_orig = pd.read_excel(self.invoice_file, skiprows=hdr_row, header=0)
+
+        if "Комментарий" not in df_orig.columns:
+            df_orig["Комментарий"] = ""
+
+        for r in self.result_rows[len(self.df):]:
+            new = {col: "" for col in df_orig.columns}
+            new.update({
+                "Код": r["Артикул"],
+                "Количество": round(r["Количество"], 2),
+                "Цена": round(r["Цена"], 2),
+                "Комментарий": r["Замена"],
+            })
+            df_orig.loc[len(df_orig)] = new
+
+        df_orig.to_excel(path, index=False)
         logging.info(f"Счёт сохранён в {path}")
 
 
