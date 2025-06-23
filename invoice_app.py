@@ -50,6 +50,18 @@ def _normalize(col: str) -> str:
         .replace("ё", "е")      # было
     )
 
+# ── поиск строки с заголовками в счёте ───────────────────────────
+def _find_header_row(path: str, max_row: int = 40) -> int:
+    """Возвращает индекс строки с заголовками таблицы счёта."""
+    for i in range(max_row):
+        row = pd.read_excel(path, skiprows=i, nrows=1, header=None).fillna("")
+        cells = [_normalize(str(c)) for c in row.values.ravel()]
+        has_code = any(c.startswith(("код", "артикул")) for c in cells)
+        has_qty = any(c.startswith("количест") or c.startswith("колво") or c.startswith("qty") for c in cells)
+        if has_code and has_qty:
+            return i
+    raise ValueError("Header row not found")
+
 # ─── настройка «жёстких» координат ───
 FIXED_STOCK_ROW = 9   # B10 → 10-я строка  ➜  index 9
 FIXED_STOCK_COL = 1   # B  → второй столбец ➜  index 1
@@ -200,31 +212,27 @@ class InvoiceProcessor:
 
     # ── загрузка счёта ────────────────────────────────────────────
     def load(self, path: str) -> None:
-        """Загружает счёт, учитывая заголовки в строке 16."""
-        try:
-            df = (
-                pd.read_excel(
-                    path,
-                    skiprows=15,
-                    header=0,
-                    usecols="C,D,F",
-                    dtype=str,
-                ).rename(columns={"Код": "Артикул"})
-            )
-        except ValueError:
-            df = (
-                pd.read_excel(
-                    path,
-                    skiprows=15,
-                    header=0,
-                    usecols="C,D",
-                    dtype=str,
-                ).rename(columns={"Код": "Артикул"})
-            )
+        """Загружает счёт, автоматически определяя строку заголовка."""
+        hdr = _find_header_row(path)
+        df = pd.read_excel(path, skiprows=hdr, header=0, dtype=str)
+
+        rename_map: dict[str, str] = {}
+        for col in df.columns:
+            norm = _normalize(col)
+            if norm.startswith(("код", "артикул")):
+                rename_map[col] = "Артикул"
+            elif norm.startswith(("количест", "колво", "qty")):
+                rename_map[col] = "Количество"
+            elif norm.startswith(("цена", "стоимость", "price")):
+                rename_map[col] = "Цена"
+
+        df.rename(columns=rename_map, inplace=True)
 
         if "Цена" not in df.columns:
             df["Цена"] = pd.NA
 
+        df = df.loc[:, [c for c in ["Артикул", "Количество", "Цена"] if c in df.columns]]
+        df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
         df.dropna(how="all", inplace=True)
 
         df["Количество"] = pd.to_numeric(df["Количество"], errors="coerce")
