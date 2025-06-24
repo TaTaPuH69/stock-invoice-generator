@@ -198,43 +198,25 @@ class StockManager:
         family: str,
         length: float,
         color: str,
-        used: list[str],
+        used: List[str],
         target_price: float,
     ) -> Optional[pd.Series]:
-        """
-        Возвращает строку-аналог:
-        • то же семейство
-        • длина ±0.05 м
-        • приоритет точно совпавшему цвету
-        • сортировка по минимальной разнице цены
-        Если ничего нет — None.
-        """
-        df = self.df
+        def _safe_eq(df: pd.DataFrame, col: str, val: str):
+            if col not in df.columns or val in ("", pd.NA, None):
+                return pd.Series(True, index=df.index)
+            return df[col] == val
 
-        # базовый фильтр
         mask = (
-            (df["Семейство"] == family)
-            & (df[self.stock_column] > 0)
-            & (~df["Артикул"].isin(used))
+            _safe_eq(self.df, "Категория", category)
+            & _safe_eq(self.df, "Цвет", color)
+            & _safe_eq(self.df, "Покрытие", coating)
+            & (~self.df["Артикул"].isin(used))
+            & (self.df[self.stock_column] > 0)
         )
-        if "Длина, м" in df.columns:
-            mask &= (df["Длина, м"].astype(float) - length).abs() <= 0.05
-
-        cand = df[mask].copy()
-        if cand.empty:
-            return None
-
-        # совпадающий цвет, если задан
-        if color and "Цвет" in cand.columns:
-            same = cand[cand["Цвет"] == color]
-            cand = same if not same.empty else cand
-
-        # ближе всех по цене
-        if pd.notna(target_price) and "price_rub" in cand.columns:
-            cand["__diff__"] = (cand["price_rub"] - target_price).abs()
-            cand = cand.sort_values("__diff__")
-
-        return cand.iloc[0]
+        cand = self.df[mask]
+        if "Ширина" in self.df.columns and width:
+            cand = cand[abs(cand["Ширина"].astype(float) - width) <= 10]
+        return None if cand.empty else cand.iloc[0]
 
 
 # ─────────────────────── InvoiceProcessor ────────────────────────
@@ -276,16 +258,10 @@ class InvoiceProcessor:
         df.dropna(how="all", inplace=True)
 
         df["Количество"] = pd.to_numeric(df["Количество"], errors="coerce")
-        df["Цена"] = pd.to_numeric(df["Цена"], errors="coerce")
+        df["Цена"] = pd.to_numeric(df.get("Цена"), errors="coerce")
         df.dropna(subset=["Количество"], inplace=True)
 
         self.df = df
-        self.invoice_path = path
-        self.output_columns = list(df.columns)
-        if "Комментарий" not in self.output_columns:
-            self.output_columns.append("Комментарий")
-
-        # ↓↓↓ дальнейший (старый) код оставляем без изменений ↓↓↓
 
         dups = self.df[self.df.duplicated("Артикул")]
         if not dups.empty:
@@ -363,11 +339,17 @@ class InvoiceProcessor:
         return df
 
     def save(self, path: str) -> None:
-        df_out = pd.DataFrame(self.result_rows, columns=self.output_columns)
-        for col in ["Цена", "Сумма", "НДС"]:
-            if col in df_out.columns:
-                df_out[col] = pd.to_numeric(df_out[col], errors="coerce").round(2)
-        df_out.to_excel(path, index=False)
+        df = self.to_dataframe()
+        total = df["Сумма"].sum()
+        vat = df["НДС"].sum()
+        tot_row = {col: "" for col in df.columns}
+        tot_row.update({
+            "Артикул": "Итого",
+            "Сумма": round(total, 2),
+            "НДС": round(vat, 2),
+        })
+        df.loc[len(df.index)] = tot_row
+        df.to_excel(path, index=False)
         logging.info(f"Счёт сохранён в {path}")
 
 
