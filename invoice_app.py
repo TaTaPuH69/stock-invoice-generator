@@ -165,6 +165,30 @@ class StockManager:
         self.df.dropna(how="all", inplace=True)
         self.df.reset_index(drop=True, inplace=True)
 
+        # --- ДОБАВЛЯЕМ ХАРАКТЕРИСТИКИ ИЗ КАТАЛОГА ---
+        #  Артикулы в каталоге хранятся как str
+        self.df["Артикул"] = self.df["Артикул"].astype(str).str.strip()
+        cat = _catalog.copy()
+        cat["code"] = cat["code"].astype(str).str.strip()
+
+        enrich = (
+            cat[["code", "family", "length_m", "color", "price_rub"]]
+            .rename(
+                columns={
+                    "code": "Артикул",
+                    "family": "Семейство",
+                    "length_m": "Длина, м",
+                    "color": "Цвет",
+                }
+            )
+        )
+        self.df = self.df.merge(enrich, on="Артикул", how="left")
+
+        # гарантируем, что нужные колонки существуют
+        for col in ["Семейство", "Длина, м", "Цвет", "price_rub"]:
+            if col not in self.df.columns:
+                self.df[col] = pd.NA
+
         self.stock_column = "Остаток"
         logging.info(f"Загружено {len(self.df)} строк остатков")
 
