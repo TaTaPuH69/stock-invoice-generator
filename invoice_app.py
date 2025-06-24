@@ -50,6 +50,18 @@ def _normalize(col: str) -> str:
         .replace("ё", "е")      # было
     )
 
+# ── поиск строки с заголовками в счёте ───────────────────────────
+def _find_header_row(path: str, max_row: int = 40) -> int:
+    """Возвращает индекс строки с заголовками таблицы счёта."""
+    for i in range(max_row):
+        row = pd.read_excel(path, skiprows=i, nrows=1, header=None).fillna("")
+        cells = [_normalize(str(c)) for c in row.values.ravel()]
+        has_code = any(c.startswith(("код", "артикул")) for c in cells)
+        has_qty = any(c.startswith("количест") or c.startswith("колво") or c.startswith("qty") for c in cells)
+        if has_code and has_qty:
+            return i
+    raise ValueError("Header row not found")
+
 # ─── настройка «жёстких» координат ───
 FIXED_STOCK_ROW = 9   # B10 → 10-я строка  ➜  index 9
 FIXED_STOCK_COL = 1   # B  → второй столбец ➜  index 1
@@ -156,6 +168,10 @@ class StockManager:
         self.stock_column = "Остаток"
         logging.info(f"Загружено {len(self.df)} строк остатков")
 
+        for col in ["Категория", "Цвет", "Покрытие", "Ширина"]:
+            if col not in self.df.columns:
+                self.df[col] = pd.NA
+
     def allocate(self, article: str, qty: float) -> Optional[pd.Series]:
         rows = self.df[self.df["Артикул"] == article]
         if not rows.empty:
@@ -165,26 +181,39 @@ class StockManager:
                 return row
         return None
 
+    def allocate_partial(self, article: str, qty: float) -> float:
+        """Списывает доступное количество и возвращает остаток."""
+        rows = self.df[self.df["Артикул"] == article]
+        if rows.empty:
+            return qty
+        row = rows.iloc[0]
+        avail = row[self.stock_column]
+        take = min(avail, qty)
+        if take > 0:
+            self.df.at[row.name, self.stock_column] -= take
+        return qty - take
+
     def find_analog(
         self,
-        category: str,
+        family: str,
+        length: float,
         color: str,
-        coating: str,
-        width: float,
         used: List[str],
+        target_price: float,
     ) -> Optional[pd.Series]:
         cand = self.df[
-            (self.df["Категория"] == category)
-            & (self.df["Цвет"] == color)
-            & (self.df["Покрытие"] == coating)
-            & (~self.df["Артикул"].isin(used))
+            (self.df["Семейство"] == family)
             & (self.df[self.stock_column] > 0)
+            & (~self.df["Артикул"].isin(used))
+            & (abs(self.df["Длина, м"].astype(float) - length) <= 0.05)
         ]
-        if "Ширина" in cand.columns:
-            cand = cand[
-                abs(cand["Ширина"].astype(float) - width) <= 10
-            ]
-        return None if cand.empty else cand.iloc[0]
+        if color:
+            same = cand[cand["Цвет"] == color]
+            cand = same if not same.empty else cand
+        if cand.empty:
+            return None
+        cand = cand.iloc[(cand["price_rub"] - target_price).abs().argsort()]
+        return cand.iloc[0]
 
 
 # ─────────────────────── InvoiceProcessor ────────────────────────
@@ -197,37 +226,60 @@ class InvoiceProcessor:
     used_analogs: List[str] = field(default_factory=list)
     result_rows: List[dict] = field(default_factory=list)
     log: List[str] = field(default_factory=list)
+    invoice_path: Optional[str] = None
+    output_columns: List[str] = field(default_factory=list)
 
     # ── загрузка счёта ────────────────────────────────────────────
     def load(self, path: str) -> None:
-        """
-        Читает Excel-счёт, пропуская 8 строк шапки (skiprows=8) и
-        аккуратно приводит числовые данные.
-        """
-        # 1) читаем таблицу начиная с 9-й строки
-        self.df = pd.read_excel(path, skiprows=8, dtype=str)
+        """Загружает счёт, автоматически определяя строку заголовка."""
+        hdr = _find_header_row(path)
+        df = pd.read_excel(path, skiprows=hdr, header=0, dtype=str)
 
-        # 2) убираем полностью пустые строки / столбцы
-        self.df.dropna(how="all", inplace=True)
-        self.df.dropna(axis=1, how="all", inplace=True)
+        rename_map: dict[str, str] = {}
+        for col in df.columns:
+            norm = _normalize(col)
+            if norm.startswith(("код", "артикул")):
+                rename_map[col] = "Артикул"
+            elif norm.startswith(("количест", "колво", "qty")):
+                rename_map[col] = "Количество"
+            elif norm.startswith(("цена", "стоимость", "price")):
+                rename_map[col] = "Цена"
 
-        # 3) переводим строки-числа в float, ошибки → NaN
-        self.df["Количество"] = pd.to_numeric(
-            self.df["Количество"], errors="coerce"
-        )
-        self.df["Цена"] = pd.to_numeric(self.df["Цена"], errors="coerce")
+        df.rename(columns=rename_map, inplace=True)
 
-        # 4) удаляем строки без количества
-        self.df.dropna(subset=["Количество"], inplace=True)
+        if "Цена" not in df.columns:
+            df["Цена"] = pd.NA
 
-        # 5) ↓↓↓ дальнейший (старый) код оставляем без изменений ↓↓↓
+        df = df.loc[:, [c for c in ["Артикул", "Количество", "Цена"] if c in df.columns]]
+        df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
+        df.dropna(how="all", inplace=True)
+
+        df["Количество"] = pd.to_numeric(df["Количество"], errors="coerce")
+        df["Цена"] = pd.to_numeric(df["Цена"], errors="coerce")
+        df.dropna(subset=["Количество"], inplace=True)
+
+        self.df = df
+        self.invoice_path = path
+        self.output_columns = list(df.columns)
+        if "Комментарий" not in self.output_columns:
+            self.output_columns.append("Комментарий")
+
+        # ↓↓↓ дальнейший (старый) код оставляем без изменений ↓↓↓
 
         dups = self.df[self.df.duplicated("Артикул")]
         if not dups.empty:
             logging.warning(f"Дубликаты в счёте: {dups['Артикул'].tolist()}")
 
-        self.original_sum = (self.df["Количество"] * self.df["Цена"]).sum()
-        logging.info(f"Загружен счёт на {self.original_sum:,.2f} ₽")
+        if self.df["Цена"].notna().any():
+            self.original_sum = (
+                self.df["Количество"] * self.df["Цена"]
+            ).sum()
+            logging.info(
+                f"Загружен счёт на {self.original_sum:,.2f} ₽"
+            )
+        else:
+            self.original_sum = 0.0
+            logging.info("Загружен счёт без цен")
 
     # ── основная логика ───────────────────────────────────────────
     def process(self) -> None:
@@ -236,58 +288,65 @@ class InvoiceProcessor:
         self.log.clear()
 
         for _, row in self.df.iterrows():
+            need = row["Количество"]
             art = row["Артикул"]
-            length_m = row.get("Длина, м", 0)
+            family = row.get("Семейство", "")
+            length = row.get("Длина, м", 0.0)
+            color = row.get("Цвет", "")
+            price = row.get("Цена", pd.NA)
 
-            analog_code = find_analog(art, length_m)
-            art_to_use = analog_code or art
-            comment = f"замена на {analog_code}" if analog_code else ""
+            left = self.stock.allocate_partial(art, need)
+            shipped = need - left
 
-            qty = row["Количество"]
-            price = row["Цена"]
+            if shipped:
+                base = {c: row.get(c, "") for c in self.output_columns}
+                base["Количество"] = int(shipped) if shipped.is_integer() else shipped
+                base.setdefault("Комментарий", "")
+                self.result_rows.append(base)
 
-            stock_row = self.stock.allocate(art_to_use, qty)
-            self.result_rows.append(
-                dict(Артикул=art_to_use, Количество=qty, Цена=price, Замена=comment)
-            )
-            if stock_row is not None:
-                continue  # всё зарезервировали
-
-            analog = self.stock.find_analog(
-                row.get("Категория", ""),
-                row.get("Цвет", ""),
-                row.get("Покрытие", ""),
-                row.get("Ширина", 0),
-                self.used_analogs,
-            )
-            if analog is None or analog[self.stock.stock_column] < qty:
-                msg = f"Не удалось найти {art} в нужном количестве"
-                self.log.append(msg)
-                logging.error(msg)
+            if left == 0:
                 continue
 
-            # списываем аналог
-            self.stock.df.at[analog.name, self.stock.stock_column] -= qty
-            self.used_analogs.append(art)
+            analog = self.stock.find_analog(
+                family=family,
+                length=length,
+                color=color,
+                used=self.used_analogs,
+                target_price=price,
+            )
+            if analog is None or analog[self.stock.stock_column] < left:
+                self.log.append(f"Не хватило {art}; аналогов нет")
+                continue
 
-            last = self.result_rows[-1]
-            last["Артикул"] = analog["Артикул"]
-            last["Замена"] = f"замена на {analog['Артикул']}"
-            self.log.append(f"{art} заменён на {analog['Артикул']}")
+            self.stock.allocate_partial(analog["Артикул"], left)
+            self.used_analogs.append(analog["Артикул"])
+
+            add = {c: "" for c in self.output_columns}
+            add.update({
+                "Артикул": analog["Артикул"],
+                "Количество": int(left) if left.is_integer() else left,
+                "Цена": round(analog["price_rub"], 2),
+                "Комментарий": f"аналог для {art}",
+            })
+            self.result_rows.append(add)
+            self.log.append(f"{art}: {left} шт → {analog['Артикул']}")
 
     # ── вывод ─────────────────────────────────────────────────────
     def to_dataframe(self) -> pd.DataFrame:
         df = pd.DataFrame(self.result_rows)
-        df["Сумма"] = df["Количество"] * df["Цена"]
-        df["НДС"] = df["Сумма"] - df["Сумма"] / (1 + VAT_RATE)
+        for col in ["Количество", "Цена"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
+        df["Сумма"] = (df["Количество"] * df["Цена"]).round(2)
+        df["НДС"] = (df["Сумма"] - df["Сумма"] / (1 + VAT_RATE)).round(2)
         return df
 
     def save(self, path: str) -> None:
-        df = self.to_dataframe()
-        total = df["Сумма"].sum()
-        vat = df["НДС"].sum()
-        df.loc[len(df.index)] = ["Итого", "", "", total, vat]
-        df.to_excel(path, index=False)
+        df_out = pd.DataFrame(self.result_rows, columns=self.output_columns)
+        for col in ["Цена", "Сумма", "НДС"]:
+            if col in df_out.columns:
+                df_out[col] = pd.to_numeric(df_out[col], errors="coerce").round(2)
+        df_out.to_excel(path, index=False)
         logging.info(f"Счёт сохранён в {path}")
 
 
