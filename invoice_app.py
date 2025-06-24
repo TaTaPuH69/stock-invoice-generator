@@ -181,13 +181,25 @@ class StockManager:
                 return row
         return None
 
+    def allocate_partial(self, article: str, qty: float) -> float:
+        """Списывает доступное количество и возвращает остаток."""
+        rows = self.df[self.df["Артикул"] == article]
+        if rows.empty:
+            return qty
+        row = rows.iloc[0]
+        avail = row[self.stock_column]
+        take = min(avail, qty)
+        if take > 0:
+            self.df.at[row.name, self.stock_column] -= take
+        return qty - take
+
     def find_analog(
         self,
-        category: str,
+        family: str,
+        length: float,
         color: str,
-        coating: str,
-        width: float,
         used: List[str],
+        target_price: float,
     ) -> Optional[pd.Series]:
         def _safe_eq(df: pd.DataFrame, col: str, val: str):
             if col not in df.columns or val in ("", pd.NA, None):
@@ -217,6 +229,8 @@ class InvoiceProcessor:
     used_analogs: List[str] = field(default_factory=list)
     result_rows: List[dict] = field(default_factory=list)
     log: List[str] = field(default_factory=list)
+    invoice_path: Optional[str] = None
+    output_columns: List[str] = field(default_factory=list)
 
     # ── загрузка счёта ────────────────────────────────────────────
     def load(self, path: str) -> None:
@@ -248,7 +262,6 @@ class InvoiceProcessor:
         df.dropna(subset=["Количество"], inplace=True)
 
         self.df = df
-        # ↓↓↓ дальнейший (старый) код оставляем без изменений ↓↓↓
 
         dups = self.df[self.df.duplicated("Артикул")]
         if not dups.empty:
@@ -272,50 +285,57 @@ class InvoiceProcessor:
         self.log.clear()
 
         for _, row in self.df.iterrows():
+            need = row["Количество"]
             art = row["Артикул"]
-            length_m = row.get("Длина, м", 0)
+            family = row.get("Семейство", "")
+            length = row.get("Длина, м", 0.0)
+            color = row.get("Цвет", "")
+            price = row.get("Цена", pd.NA)
 
-            analog_code = find_analog(art, length_m)
-            art_to_use = analog_code or art
-            comment = f"замена на {analog_code}" if analog_code else ""
+            left = self.stock.allocate_partial(art, need)
+            shipped = need - left
 
-            qty = row["Количество"]
-            price = row["Цена"]
+            if shipped:
+                base = {c: row.get(c, "") for c in self.output_columns}
+                base["Количество"] = int(shipped) if shipped.is_integer() else shipped
+                base.setdefault("Комментарий", "")
+                self.result_rows.append(base)
 
-            stock_row = self.stock.allocate(art_to_use, qty)
-            self.result_rows.append(
-                dict(Артикул=art_to_use, Количество=qty, Цена=price, Замена=comment)
-            )
-            if stock_row is not None:
-                continue  # всё зарезервировали
-
-            analog = self.stock.find_analog(
-                row.get("Категория", ""),
-                row.get("Цвет", ""),
-                row.get("Покрытие", ""),
-                row.get("Ширина", 0),
-                self.used_analogs,
-            )
-            if analog is None or analog[self.stock.stock_column] < qty:
-                msg = f"Не удалось найти {art} в нужном количестве"
-                self.log.append(msg)
-                logging.error(msg)
+            if left == 0:
                 continue
 
-            # списываем аналог
-            self.stock.df.at[analog.name, self.stock.stock_column] -= qty
-            self.used_analogs.append(art)
+            analog = self.stock.find_analog(
+                family=family,
+                length=length,
+                color=color,
+                used=self.used_analogs,
+                target_price=price,
+            )
+            if analog is None or analog[self.stock.stock_column] < left:
+                self.log.append(f"Не хватило {art}; аналогов нет")
+                continue
 
-            last = self.result_rows[-1]
-            last["Артикул"] = analog["Артикул"]
-            last["Замена"] = f"замена на {analog['Артикул']}"
-            self.log.append(f"{art} заменён на {analog['Артикул']}")
+            self.stock.allocate_partial(analog["Артикул"], left)
+            self.used_analogs.append(analog["Артикул"])
+
+            add = {c: "" for c in self.output_columns}
+            add.update({
+                "Артикул": analog["Артикул"],
+                "Количество": int(left) if left.is_integer() else left,
+                "Цена": round(analog["price_rub"], 2),
+                "Комментарий": f"аналог для {art}",
+            })
+            self.result_rows.append(add)
+            self.log.append(f"{art}: {left} шт → {analog['Артикул']}")
 
     # ── вывод ─────────────────────────────────────────────────────
     def to_dataframe(self) -> pd.DataFrame:
         df = pd.DataFrame(self.result_rows)
-        df["Сумма"] = df["Количество"] * df["Цена"]
-        df["НДС"] = df["Сумма"] - df["Сумма"] / (1 + VAT_RATE)
+        for col in ["Количество", "Цена"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
+        df["Сумма"] = (df["Количество"] * df["Цена"]).round(2)
+        df["НДС"] = (df["Сумма"] - df["Сумма"] / (1 + VAT_RATE)).round(2)
         return df
 
     def save(self, path: str) -> None:
