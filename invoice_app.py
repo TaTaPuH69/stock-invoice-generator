@@ -165,8 +165,6 @@ class StockManager:
         self.df.dropna(how="all", inplace=True)
         self.df.reset_index(drop=True, inplace=True)
 
-        # --- ENRICH -------------------------------------------------
-        # приводим код к str и мержим с _catalog
         self.df["Артикул"] = self.df["Артикул"].astype(str).str.strip()
         cat = _catalog.copy()
         cat["code"] = cat["code"].astype(str).str.strip()
