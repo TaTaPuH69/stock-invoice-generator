@@ -165,6 +165,41 @@ class StockManager:
         self.df.dropna(how="all", inplace=True)
         self.df.reset_index(drop=True, inplace=True)
 
+        # --- ENRICH -------------------------------------------------
+        # приводим код к str и мержим с _catalog
+        self.df["Артикул"] = self.df["Артикул"].astype(str).str.strip()
+        cat = _catalog.copy()
+        cat["code"] = cat["code"].astype(str).str.strip()
+
+        enrich = (
+            cat[["code", "family", "length_m", "color", "price_rub"]]
+            .rename(
+                columns={
+                    "code": "Артикул",
+                    "family": "Семейство",
+                    "length_m": "Длина, м",
+                    "color": "Цвет",
+                }
+            )
+        )
+        self.df = self.df.merge(enrich, on="Артикул", how="left")
+
+        # устраняем возможные дубли «Семейство_x / Семейство_y» и т.п.
+        norm2orig = {}
+        for col in list(self.df.columns):
+            key = _normalize(col)
+            if key in norm2orig:
+                primary = norm2orig[key]
+                self.df[primary] = self.df[primary].fillna(self.df[col])
+                self.df.drop(columns=[col], inplace=True)
+            else:
+                norm2orig[key] = col
+
+        # гарантируем обязательные поля
+        for col in ["Семейство", "Длина, м", "Цвет", "price_rub"]:
+            if col not in self.df.columns:
+                self.df[col] = pd.NA
+
         self.stock_column = "Остаток"
         logging.info(f"Загружено {len(self.df)} строк остатков")
 
