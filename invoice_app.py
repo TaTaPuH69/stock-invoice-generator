@@ -236,22 +236,10 @@ class StockManager:
         used: list[str],
         target_price: float,
     ) -> Optional[pd.Series]:
-        """
-        Возвращает строку-аналог:
-        • то же семейство
-        • длина ±0.05 м
-        • приоритет точно совпавшему цвету
-        • сортировка по минимальной разнице цены
-        Если ничего нет — None.
-        """
         df = self.df
 
-        fam_col = next((c for c in df.columns if _normalize(c) == "семейство"), None)
-        family_mask = df[fam_col] == family if fam_col else pd.Series(True, index=df.index)
-
-        # базовый фильтр
         mask = (
-            family_mask
+            (df["Семейство"] == family)
             & (df[self.stock_column] > 0)
             & (~df["Артикул"].isin(used))
         )
@@ -262,12 +250,10 @@ class StockManager:
         if cand.empty:
             return None
 
-        # совпадающий цвет, если задан
         if color and "Цвет" in cand.columns:
             same = cand[cand["Цвет"] == color]
             cand = same if not same.empty else cand
 
-        # ближе всех по цене
         if pd.notna(target_price) and "price_rub" in cand.columns:
             cand["__diff__"] = (cand["price_rub"] - target_price).abs()
             cand = cand.sort_values("__diff__")
@@ -314,16 +300,10 @@ class InvoiceProcessor:
         df.dropna(how="all", inplace=True)
 
         df["Количество"] = pd.to_numeric(df["Количество"], errors="coerce")
-        df["Цена"] = pd.to_numeric(df["Цена"], errors="coerce")
+        df["Цена"] = pd.to_numeric(df.get("Цена"), errors="coerce")
         df.dropna(subset=["Количество"], inplace=True)
 
-        self.output_columns = list(df.columns)
-        if "Комментарий" not in self.output_columns:
-            self.output_columns.append("Комментарий")
-        self.invoice_path = path
         self.df = df
-
-        # ↓↓↓ дальнейший (старый) код оставляем без изменений ↓↓↓
 
         dups = self.df[self.df.duplicated("Артикул")]
         if not dups.empty:
@@ -349,21 +329,10 @@ class InvoiceProcessor:
         for _, row in self.df.iterrows():
             need = row["Количество"]
             art = row["Артикул"]
-            # --- LOOKUP ---------------------------------------------------
-            if art in _catalog["code"].values:
-                cat_row = _catalog[_catalog["code"] == art].iloc[0]
-                family = row.get("Семейство") or cat_row["family"]
-                length = row.get("Длина, м") or cat_row["length_m"]
-                color = row.get("Цвет") or cat_row["color"]
-                price = row.get("Цена", pd.NA)
-                if pd.isna(price):
-                    price = cat_row["price_rub"]
-            else:
-                family = row.get("Семейство", "")
-                length = row.get("Длина, м", 0.0)
-                color = row.get("Цвет", "")
-                price = row.get("Цена", pd.NA)
-            # ----------------------------------------------------------------
+            family = row.get("Семейство", "")
+            length = row.get("Длина, м", 0.0)
+            color = row.get("Цвет", "")
+            price = row.get("Цена", pd.NA)
 
             left = self.stock.allocate_partial(art, need)
             shipped = need - left
@@ -404,8 +373,6 @@ class InvoiceProcessor:
     # ── вывод ─────────────────────────────────────────────────────
     def to_dataframe(self) -> pd.DataFrame:
         df = pd.DataFrame(self.result_rows)
-        if "Комментарий" not in df.columns:
-            df["Комментарий"] = ""
         for col in ["Количество", "Цена"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
@@ -414,24 +381,17 @@ class InvoiceProcessor:
         return df
 
     def save(self, path: str) -> None:
-        """
-        Берём оригинальный счёт (self.invoice_path), дописываем новые строки
-        result_rows в том же формате и порядке колонок, сохраняем в path.
-        """
-        base_df = pd.read_excel(
-            self.invoice_path,
-            skiprows=_find_header_row(self.invoice_path),
-            header=0,
-            dtype=str,
-        )
-        if "Комментарий" not in base_df.columns:
-            base_df["Комментарий"] = ""
-        for r in self.result_rows[len(self.df):]:
-            new = {c: "" for c in base_df.columns}
-            for k, v in r.items():
-                new[k] = v
-            base_df.loc[len(base_df)] = new
-        base_df.to_excel(path, index=False)
+        df = self.to_dataframe()
+        total = df["Сумма"].sum()
+        vat = df["НДС"].sum()
+        tot_row = {col: "" for col in df.columns}
+        tot_row.update({
+            "Артикул": "Итого",
+            "Сумма": round(total, 2),
+            "НДС": round(vat, 2),
+        })
+        df.loc[len(df.index)] = tot_row
+        df.to_excel(path, index=False)
         logging.info(f"Счёт сохранён в {path}")
 
 
