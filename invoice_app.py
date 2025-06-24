@@ -9,6 +9,7 @@ Invoice Builder GUI
 from __future__ import annotations
 
 import os
+import shutil
 import logging
 import re
 import unicodedata
@@ -326,6 +327,16 @@ class InvoiceProcessor:
         self.result_rows.clear()
         self.log.clear()
 
+        # --- VALIDATE INPUT -------------------------------------------------
+        required_cols = {"Артикул", "Количество"}
+        missing = required_cols - set(self.df.columns)
+        if missing:
+            msg = f"В счёте нет колонок: {', '.join(missing)}"
+            self.log.append(msg)
+            logging.error(msg)
+            return
+        # --------------------------------------------------------------------
+
         for _, row in self.df.iterrows():
             need = row["Количество"]
             art = row["Артикул"]
@@ -378,11 +389,30 @@ class InvoiceProcessor:
                 df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
         df["Сумма"] = (df["Количество"] * df["Цена"]).round(2)
         df["НДС"] = (df["Сумма"] - df["Сумма"] / (1 + VAT_RATE)).round(2)
-        return df
+        """Собирает итоговый DataFrame, даже если result_rows пуст."""
+        if not self.result_rows:
+            cols = [
+                "Артикул",
+                "Количество",
+                "Цена",
+                "Комментарий",
+                "Сумма",
+                "НДС",
+            ]
+            return pd.DataFrame(columns=cols)
 
-    def save(self, path: str) -> None:
-        df = self.to_dataframe()
-        total = df["Сумма"].sum()
+        for col in ["Количество", "Цена", "Комментарий"]:
+            if col not in df.columns:
+                df[col] = pd.NA
+
+        df["Количество"] = pd.to_numeric(df["Количество"], errors="coerce")
+        df["Цена"] = pd.to_numeric(df["Цена"], errors="coerce")
+        if self.result_rows == []:
+            # ничего не изменили → копируем оригинал
+            shutil.copy(self.invoice_path, path)
+            logging.info("Изменений нет — исходный счёт сохранён как есть")
+            return
+
         vat = df["НДС"].sum()
         tot_row = {col: "" for col in df.columns}
         tot_row.update({
