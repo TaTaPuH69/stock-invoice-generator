@@ -198,19 +198,30 @@ class StockManager:
         family: str,
         length: float,
         color: str,
-        used: List[str],
+        used: list[str],
         target_price: float,
     ) -> Optional[pd.Series]:
-        def _safe_eq(df: pd.DataFrame, col: str, val: str):
-            if col not in df.columns or val in ("", pd.NA, None):
-                return pd.Series(True, index=df.index)
-            return df[col] == val
+        """Ищет аналог внутри того же семейства и длины."""
+        df = self.df
 
         mask = (
-            _safe_eq(self.df, "Категория", category)
-            & _safe_eq(self.df, "Цвет", color)
-            & _safe_eq(self.df, "Покрытие", coating)
-            & (~self.df["Артикул"].isin(used))
+            (df["Семейство"] == family)
+            & (df[self.stock_column] > 0)
+            & (~df["Артикул"].isin(used))
+        )
+        if "Длина, м" in df.columns:
+            mask &= (df["Длина, м"].astype(float) - length).abs() <= 0.05
+
+        cand = df[mask].copy()
+
+        if color and "Цвет" in cand.columns:
+            same = cand[cand["Цвет"] == color]
+            cand = same if not same.empty else cand
+
+        if pd.notna(target_price) and "price_rub" in cand.columns:
+            cand["__diff__"] = (cand["price_rub"] - target_price).abs()
+            cand = cand.sort_values("__diff__")
+
             & (self.df[self.stock_column] > 0)
         )
         cand = self.df[mask]
