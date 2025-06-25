@@ -393,19 +393,28 @@ class InvoiceProcessor:
         df["НДС"] = (df["Сумма"] - df["Сумма"] / (1 + VAT_RATE)).round(2)
         return df
 
-    def save(self, path: str) -> None:
-        df = self.to_dataframe()
-        total = df["Сумма"].sum()
-        vat = df["НДС"].sum()
-        tot_row = {col: "" for col in df.columns}
-        tot_row.update({
-            "Артикул": "Итого",
-            "Сумма": round(total, 2),
-            "НДС": round(vat, 2),
-        })
-        df.loc[len(df.index)] = tot_row
-        df.to_excel(path, index=False)
-        logging.info(f"Счёт сохранён в {path}")
+def save(self, path: str) -> None:
+    # Открываем исходный счет
+    base = pd.read_excel(
+        self.invoice_path,
+        skiprows=_find_header_row(self.invoice_path),
+        header=0,
+        dtype=str
+    )
+    if "Комментарий" not in base.columns:
+        base["Комментарий"] = ""
+
+    # Добавляем новые строки-аналоги (если они есть)
+    add_rows = [
+        {c: r.get(c, "") for c in base.columns}
+        for r in self.result_rows[len(self.df):]
+    ]
+    if add_rows:
+        base = pd.concat([base, pd.DataFrame(add_rows)], ignore_index=True)
+
+    base.to_excel(path, index=False)
+    logging.info(f"Счёт сохранён в {path}")
+
 
 
 # ───────────────────────────── GUI ───────────────────────────────
