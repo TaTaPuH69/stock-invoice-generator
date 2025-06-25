@@ -357,7 +357,7 @@ class InvoiceProcessor:
 
             analog = self.stock.find_analog(
                 family=family,
-                length=length,
+                for k in self.output_columns:
                 color=color,
                 used=self.used_analogs,
                 target_price=price,
@@ -376,23 +376,15 @@ class InvoiceProcessor:
                 "Цена": round(analog["price_rub"], 2),
                 "Комментарий": f"аналог для {art}",
             })
-            self.result_rows.append(add)
+            for k in self.output_columns:
             self.log.append(f"{art}: {left} шт → {analog['Артикул']}")
 
     # ── вывод ─────────────────────────────────────────────────────
     def to_dataframe(self) -> pd.DataFrame:
+        """Возвращает только строки-результаты без доп. расчётов."""
         if not self.result_rows:
-            cols = ["Артикул", "Количество", "Цена", "Комментарий"]
-            return pd.DataFrame(columns=cols)
-
-        df = pd.DataFrame(self.result_rows)
-        for col in ["Количество", "Цена"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
-        df["Сумма"] = (df["Количество"] * df["Цена"]).round(2)
-        df["НДС"] = (df["Сумма"] - df["Сумма"] / (1 + VAT_RATE)).round(2)
-        return df
-
+            return pd.DataFrame(columns=self.output_columns)
+        return pd.DataFrame(self.result_rows, columns=self.output_columns)
     def save(self, path: str) -> None:
         df = self.to_dataframe()
         total = df["Сумма"].sum()
