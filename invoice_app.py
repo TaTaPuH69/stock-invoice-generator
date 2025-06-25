@@ -14,7 +14,7 @@ import logging
 import re
 import unicodedata
 import pandas as pd
-from pathlib import Path
+from flexy_catalog_loader import load_catalog
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -29,8 +29,7 @@ logging.basicConfig(
 )
 
 VAT_RATE = 0.20
-CATALOG_PATH = Path("profiles_catalog.xlsx")
-_catalog = pd.read_excel(CATALOG_PATH)
+_catalog = load_catalog()
 
 # ─── util: нормализуем имя колонки ───
 def _normalize(col: str) -> str:
@@ -241,22 +240,15 @@ class StockManager:
             (df["Семейство"] == family)
             & (df[self.stock_column] > 0)
             & (~df["Артикул"].isin(used))
+            & ((df["Длина, м"].astype(float) - length).abs() <= 0.05)
         )
-        if "Длина, м" in df.columns:
-            mask &= (df["Длина, м"].astype(float) - length).abs() <= 0.05
-
-        cand = df[mask].copy()
-        if cand.empty:
-            return None
-
-        if color and "Цвет" in cand.columns:
+        cand = df[mask]
+        if color:
             same = cand[cand["Цвет"] == color]
             cand = same if not same.empty else cand
-
-        if pd.notna(target_price) and "price_rub" in cand.columns:
-            cand["__diff__"] = (cand["price_rub"] - target_price).abs()
-            cand = cand.sort_values("__diff__")
-
+        if cand.empty:
+            return None
+        cand = cand.iloc[(cand["price_rub"] - target_price).abs().argsort()]
         return cand.iloc[0]
 
 
@@ -278,6 +270,17 @@ class InvoiceProcessor:
         """Загружает счёт, автоматически определяя строку заголовка."""
         hdr = _find_header_row(path)
         df = pd.read_excel(path, skiprows=hdr, header=0, dtype=str)
+        self.invoice_path = path
+        self.output_columns = [
+            "Товар",
+            "Код",
+            "Количество",
+            "Ед.",
+            "Цена",
+            "в т.ч. НДС",
+            "Всего",
+            "Комментарий",
+        ]
 
         rename_map: dict[str, str] = {}
         for col in df.columns:
@@ -343,6 +346,15 @@ class InvoiceProcessor:
             color = row.get("Цвет", "")
             price = row.get("Цена", pd.NA)
 
+            cat_row = _catalog[_catalog["code"] == art]
+            if not cat_row.empty:
+                cat_row = cat_row.iloc[0]
+                family = cat_row["family"]
+                length = cat_row["length_m"]
+                color = cat_row["color"]
+                if pd.isna(price):
+                    price = cat_row["price_rub"]
+
             left = self.stock.allocate_partial(art, need)
             shipped = need - left
 
@@ -389,31 +401,31 @@ class InvoiceProcessor:
         for col in ["Количество", "Цена"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
-        df["Сумма"] = (df["Количество"] * df["Цена"]).round(2)
-        df["НДС"] = (df["Сумма"] - df["Сумма"] / (1 + VAT_RATE)).round(2)
         return df
 
-def save(self, path: str) -> None:
-    # Открываем исходный счет
-    base = pd.read_excel(
-        self.invoice_path,
-        skiprows=_find_header_row(self.invoice_path),
-        header=0,
-        dtype=str
-    )
-    if "Комментарий" not in base.columns:
-        base["Комментарий"] = ""
+    def save(self, path: str) -> None:
+        if not self.result_rows:
+            shutil.copyfile(self.invoice_path, path)
+            return
 
-    # Добавляем новые строки-аналоги (если они есть)
-    add_rows = [
-        {c: r.get(c, "") for c in base.columns}
-        for r in self.result_rows[len(self.df):]
-    ]
-    if add_rows:
-        base = pd.concat([base, pd.DataFrame(add_rows)], ignore_index=True)
+        base = pd.read_excel(
+            self.invoice_path,
+            skiprows=_find_header_row(self.invoice_path),
+            header=0,
+            dtype=str,
+        )
+        if "Комментарий" not in base.columns:
+            base["Комментарий"] = ""
 
-    base.to_excel(path, index=False)
-    logging.info(f"Счёт сохранён в {path}")
+        add = [
+            {c: r.get(c, "") for c in base.columns}
+            for r in self.result_rows[len(self.df):]
+        ]
+        if add:
+            base = pd.concat([base, pd.DataFrame(add)], ignore_index=True)
+
+        base.to_excel(path, index=False)
+        logging.info(f"Счёт сохранён в {path}")
 
 
 
