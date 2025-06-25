@@ -9,6 +9,7 @@ Invoice Builder GUI
 from __future__ import annotations
 
 import os
+import shutil
 import logging
 import re
 import unicodedata
@@ -324,6 +325,16 @@ class InvoiceProcessor:
         self.result_rows.clear()
         self.log.clear()
 
+        # --- VALIDATE INPUT -------------------------------------------------
+        required_cols = {"Артикул", "Количество"}
+        missing = required_cols - set(self.df.columns)
+        if missing:
+            msg = f"В счёте нет колонок: {', '.join(missing)}"
+            self.log.append(msg)
+            logging.error(msg)
+            return
+        # --------------------------------------------------------------------
+
         for _, row in self.df.iterrows():
             need = row["Количество"]
             art = row["Артикул"]
@@ -370,6 +381,10 @@ class InvoiceProcessor:
 
     # ── вывод ─────────────────────────────────────────────────────
     def to_dataframe(self) -> pd.DataFrame:
+        if not self.result_rows:
+            cols = ["Артикул", "Количество", "Цена", "Комментарий"]
+            return pd.DataFrame(columns=cols)
+
         df = pd.DataFrame(self.result_rows)
         for col in ["Количество", "Цена"]:
             if col in df.columns:
