@@ -14,6 +14,11 @@ import logging
 import re
 import unicodedata
 import pandas as pd
+
+def _is_filled(val) -> bool:
+    """True, если val не None, не pd.NA и не пустая строка."""
+    return pd.notna(val) and str(val).strip() != ""
+
 from flexy_catalog_loader import load_catalog
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -243,7 +248,7 @@ class StockManager:
             & ((df["Длина, м"].astype(float) - length).abs() <= 0.05)
         )
         cand = df[mask]
-        if color:
+        if _is_filled(color) and "Цвет" in cand.columns:
             same = cand[cand["Цвет"] == color]
             cand = same if not same.empty else cand
         if cand.empty:
