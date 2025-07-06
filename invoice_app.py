@@ -305,6 +305,24 @@ class InvoiceProcessor:
         df["Цена"] = pd.to_numeric(df.get("Цена"), errors="coerce")
         df.dropna(subset=["Количество"], inplace=True)
 
+        # запоминаем реальные названия колонок кода/кол-ва/цены
+        self.col_code = next(
+            (c for c in df.columns if _normalize(c).startswith(("код", "артикул"))),
+            "Артикул",
+        )
+        self.col_qty = next(
+            (c for c in df.columns if _normalize(c).startswith("кол")),
+            "Количество",
+        )
+        self.col_price = next(
+            (
+                c
+                for c in df.columns
+                if _normalize(c).startswith(("цена", "стоимость", "price"))
+            ),
+            "Цена",
+        )
+
         self.df = df
 
         dups = self.df[self.df.duplicated("Артикул")]
@@ -339,12 +357,21 @@ class InvoiceProcessor:
         # --------------------------------------------------------------------
 
         for _, row in self.df.iterrows():
-            need = row["Количество"]
-            art = row["Артикул"]
-            family = row.get("Семейство", "")
-            length = row.get("Длина, м", 0.0)
-            color = row.get("Цвет", "")
-            price = row.get("Цена", pd.NA)
+            art = row[self.col_code]
+            need = row[self.col_qty]
+            price = row.get(self.col_price, pd.NA)
+
+            # вытягиваем характеристики из Flexy-каталога
+            cat_row = _catalog[_catalog["code"] == art]
+            if not cat_row.empty:
+                cat_row = cat_row.iloc[0]
+                family = cat_row["family"]
+                length = float(cat_row["length_m"])
+                color = cat_row["color"]
+                if pd.isna(price):
+                    price = cat_row["price_rub"]
+            else:
+                family = length = color = pd.NA  # безопасно
 
             cat_row = _catalog[_catalog["code"] == art]
             if not cat_row.empty:
@@ -358,38 +385,46 @@ class InvoiceProcessor:
             left = self.stock.allocate_partial(art, need)
             shipped = need - left
 
+            # ----- строка с фактически списанным количеством -----
             if shipped:
-                base = {c: row.get(c, "") for c in self.output_columns}
-                base["Количество"] = int(shipped) if shipped.is_integer() else shipped
-                base.setdefault("Комментарий", "")
+                base = {c: "" for c in self.output_columns}
+                for c in self.output_columns:
+                    if c == self.col_code:
+                        base[c] = art
+                    elif c == self.col_qty:
+                        base[c] = shipped
+                    elif c == self.col_price and pd.notna(price):
+                        base[c] = price
+                    else:
+                        base[c] = row.get(c, "")
                 self.result_rows.append(base)
 
-            if left == 0:
-                continue
+            # ----- если нужен аналог -----
+            if left:
+                analog = self.stock.find_analog(
+                    family=family,
+                    length=length,
+                    color=color,
+                    used=self.used_analogs,
+                    target_price=price,
+                )
+                if analog is None or analog[self.stock.stock_column] < left:
+                    self.log.append(f"{art}: аналогов нет")
+                    continue
 
-            analog = self.stock.find_analog(
-                family=family,
-                length=length,
-                color=color,
-                used=self.used_analogs,
-                target_price=price,
-            )
-            if analog is None or analog[self.stock.stock_column] < left:
-                self.log.append(f"Не хватило {art}; аналогов нет")
-                continue
+                self.stock.allocate_partial(analog["Артикул"], left)
+                self.used_analogs.append(analog["Артикул"])
 
-            self.stock.allocate_partial(analog["Артикул"], left)
-            self.used_analogs.append(analog["Артикул"])
-
-            add = {c: "" for c in self.output_columns}
-            add.update({
-                "Артикул": analog["Артикул"],
-                "Количество": int(left) if left.is_integer() else left,
-                "Цена": round(analog["price_rub"], 2),
-                "Комментарий": f"аналог для {art}",
-            })
-            self.result_rows.append(add)
-            self.log.append(f"{art}: {left} шт → {analog['Артикул']}")
+                add = {c: "" for c in self.output_columns}
+                add[self.col_code] = analog["Артикул"]
+                add[self.col_qty] = left
+                add[self.col_price] = analog["price_rub"]
+                # копируем остальные поля из исходной строки (Товар, Ед., …)
+                for c in self.output_columns:
+                    if add[c] == "" and c in row:
+                        add[c] = row[c]
+                self.result_rows.append(add)
+                self.log.append(f"{art}: {left} шт → {analog['Артикул']}")
 
     # ── вывод ─────────────────────────────────────────────────────
     def to_dataframe(self) -> pd.DataFrame:
