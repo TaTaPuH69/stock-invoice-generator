@@ -14,7 +14,13 @@ import logging
 import re
 import unicodedata
 import pandas as pd
-from pathlib import Path
+
+def _is_filled(val) -> bool:
+    """Return True if val is not empty, None or pd.NA."""
+    # helper to avoid TypeError when checking color
+    return pd.notna(val) and str(val).strip() != ""
+
+from flexy_catalog_loader import load_catalog
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -29,8 +35,7 @@ logging.basicConfig(
 )
 
 VAT_RATE = 0.20
-CATALOG_PATH = Path("profiles_catalog.xlsx")
-_catalog = pd.read_excel(CATALOG_PATH)
+_catalog = load_catalog()
 
 # ─── util: нормализуем имя колонки ───
 def _normalize(col: str) -> str:
@@ -241,22 +246,16 @@ class StockManager:
             (df["Семейство"] == family)
             & (df[self.stock_column] > 0)
             & (~df["Артикул"].isin(used))
+            & ((df["Длина, м"].astype(float) - length).abs() <= 0.05)
         )
-        if "Длина, м" in df.columns:
-            mask &= (df["Длина, м"].astype(float) - length).abs() <= 0.05
-
-        cand = df[mask].copy()
-        if cand.empty:
-            return None
-
-        if color and "Цвет" in cand.columns:
+        cand = df[mask]
+        # Проверяем цвет только если не NA и не пустой
+        if _is_filled(color) and "Цвет" in cand.columns:
             same = cand[cand["Цвет"] == color]
             cand = same if not same.empty else cand
-
-        if pd.notna(target_price) and "price_rub" in cand.columns:
-            cand["__diff__"] = (cand["price_rub"] - target_price).abs()
-            cand = cand.sort_values("__diff__")
-
+        if cand.empty:
+            return None
+        cand = cand.iloc[(cand["price_rub"] - target_price).abs().argsort()]
         return cand.iloc[0]
 
 
@@ -278,6 +277,17 @@ class InvoiceProcessor:
         """Загружает счёт, автоматически определяя строку заголовка."""
         hdr = _find_header_row(path)
         df = pd.read_excel(path, skiprows=hdr, header=0, dtype=str)
+        self.invoice_path = path
+        self.output_columns = [
+            "Товар",
+            "Код",
+            "Количество",
+            "Ед.",
+            "Цена",
+            "в т.ч. НДС",
+            "Всего",
+            "Комментарий",
+        ]
 
         rename_map: dict[str, str] = {}
         for col in df.columns:
@@ -301,6 +311,24 @@ class InvoiceProcessor:
         df["Количество"] = pd.to_numeric(df["Количество"], errors="coerce")
         df["Цена"] = pd.to_numeric(df.get("Цена"), errors="coerce")
         df.dropna(subset=["Количество"], inplace=True)
+
+        # запоминаем реальные названия колонок кода/кол-ва/цены
+        self.col_code = next(
+            (c for c in df.columns if _normalize(c).startswith(("код", "артикул"))),
+            "Артикул",
+        )
+        self.col_qty = next(
+            (c for c in df.columns if _normalize(c).startswith("кол")),
+            "Количество",
+        )
+        self.col_price = next(
+            (
+                c
+                for c in df.columns
+                if _normalize(c).startswith(("цена", "стоимость", "price"))
+            ),
+            "Цена",
+        )
 
         self.df = df
 
@@ -336,48 +364,65 @@ class InvoiceProcessor:
         # --------------------------------------------------------------------
 
         for _, row in self.df.iterrows():
-            need = row["Количество"]
-            art = row["Артикул"]
-            family = row.get("Семейство", "")
-            length = row.get("Длина, м", 0.0)
-            color = row.get("Цвет", "")
-            price = row.get("Цена", pd.NA)
+            art = row[self.col_code]
+            need = row[self.col_qty]
+            price = row.get(self.col_price, pd.NA)
+
+            # вытягиваем характеристики из Flexy-каталога
+            cat_row = _catalog[_catalog["code"] == art]
+            if not cat_row.empty:
+                cat_row = cat_row.iloc[0]
+                family = cat_row["family"]
+                length = float(cat_row["length_m"])
+                color = cat_row["color"]
+                if pd.isna(price):
+                    price = cat_row["price_rub"]
+            else:
+                family = length = color = pd.NA  # безопасно
 
             left = self.stock.allocate_partial(art, need)
             shipped = need - left
 
+            # ----- строка с фактически списанным количеством -----
             if shipped:
-                base = {c: row.get(c, "") for c in self.output_columns}
-                base["Количество"] = int(shipped) if shipped.is_integer() else shipped
-                base.setdefault("Комментарий", "")
+                base = {c: "" for c in self.output_columns}
+                for c in self.output_columns:
+                    if c == self.col_code:
+                        base[c] = art
+                    elif c == self.col_qty:
+                        base[c] = shipped
+                    elif c == self.col_price and pd.notna(price):
+                        base[c] = price
+                    else:
+                        base[c] = row.get(c, "")
                 self.result_rows.append(base)
 
-            if left == 0:
-                continue
+            # ----- если нужен аналог -----
+            if left:
+                analog = self.stock.find_analog(
+                    family=family,
+                    length=length,
+                    color=color,
+                    used=self.used_analogs,
+                    target_price=price,
+                )
+                if analog is None or analog[self.stock.stock_column] < left:
+                    self.log.append(f"{art}: аналогов нет")
+                    continue
 
-            analog = self.stock.find_analog(
-                family=family,
-                length=length,
-                color=color,
-                used=self.used_analogs,
-                target_price=price,
-            )
-            if analog is None or analog[self.stock.stock_column] < left:
-                self.log.append(f"Не хватило {art}; аналогов нет")
-                continue
+                self.stock.allocate_partial(analog["Артикул"], left)
+                self.used_analogs.append(analog["Артикул"])
 
-            self.stock.allocate_partial(analog["Артикул"], left)
-            self.used_analogs.append(analog["Артикул"])
-
-            add = {c: "" for c in self.output_columns}
-            add.update({
-                "Артикул": analog["Артикул"],
-                "Количество": int(left) if left.is_integer() else left,
-                "Цена": round(analog["price_rub"], 2),
-                "Комментарий": f"аналог для {art}",
-            })
-            self.result_rows.append(add)
-            self.log.append(f"{art}: {left} шт → {analog['Артикул']}")
+                add = {c: "" for c in self.output_columns}
+                add[self.col_code] = analog["Артикул"]
+                add[self.col_qty] = left
+                add[self.col_price] = analog["price_rub"]
+                # копируем остальные поля из исходной строки (Товар, Ед., …)
+                for c in self.output_columns:
+                    if add[c] == "" and c in row:
+                        add[c] = row[c]
+                self.result_rows.append(add)
+                self.log.append(f"{art}: {left} шт → {analog['Артикул']}")
 
     # ── вывод ─────────────────────────────────────────────────────
     def to_dataframe(self) -> pd.DataFrame:
@@ -389,31 +434,43 @@ class InvoiceProcessor:
         for col in ["Количество", "Цена"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
-        df["Сумма"] = (df["Количество"] * df["Цена"]).round(2)
-        df["НДС"] = (df["Сумма"] - df["Сумма"] / (1 + VAT_RATE)).round(2)
         return df
 
-def save(self, path: str) -> None:
-    # Открываем исходный счет
-    base = pd.read_excel(
-        self.invoice_path,
-        skiprows=_find_header_row(self.invoice_path),
-        header=0,
-        dtype=str
-    )
-    if "Комментарий" not in base.columns:
-        base["Комментарий"] = ""
+    def save(self, path: str) -> None:
+        if not self.result_rows:
+            shutil.copyfile(self.invoice_path, path)
+            return
 
-    # Добавляем новые строки-аналоги (если они есть)
-    add_rows = [
-        {c: r.get(c, "") for c in base.columns}
-        for r in self.result_rows[len(self.df):]
-    ]
-    if add_rows:
-        base = pd.concat([base, pd.DataFrame(add_rows)], ignore_index=True)
+        base = pd.read_excel(
+            self.invoice_path,
+            skiprows=_find_header_row(self.invoice_path),
+            header=0,
+            dtype=str,
+        )
+        if "Комментарий" not in base.columns:
+            base["Комментарий"] = ""
 
-    base.to_excel(path, index=False)
-    logging.info(f"Счёт сохранён в {path}")
+        add_rows = [
+            {c: r.get(c, "") for c in base.columns}
+            for r in self.result_rows[len(self.df):]
+        ]
+        if add_rows:
+            if (
+                "Всего" in base.columns
+                and self.col_price in base.columns
+                and self.col_qty in base.columns
+            ):
+                for r in add_rows:
+                    try:
+                        qty = float(str(r[self.col_qty]).replace(",", "."))
+                        pr = float(str(r[self.col_price]).replace(",", "."))
+                        r["Всего"] = round(qty * pr, 2)
+                    except Exception:
+                        pass  # оставляем пустым, если не удалось
+            base = pd.concat([base, pd.DataFrame(add_rows)], ignore_index=True)
+
+        base.to_excel(path, index=False)
+        logging.info(f"Счёт сохранён в {path}")
 
 
 
