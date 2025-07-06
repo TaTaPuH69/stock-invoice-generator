@@ -14,12 +14,6 @@ import logging
 import re
 import unicodedata
 import pandas as pd
-
-def _is_filled(val) -> bool:
-    """Return True if val is not empty, None or pd.NA."""
-    # helper to avoid TypeError when checking color
-    return pd.notna(val) and str(val).strip() != ""
-
 from flexy_catalog_loader import load_catalog
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -249,8 +243,7 @@ class StockManager:
             & ((df["Длина, м"].astype(float) - length).abs() <= 0.05)
         )
         cand = df[mask]
-        # Проверяем цвет только если не NA и не пустой
-        if _is_filled(color) and "Цвет" in cand.columns:
+        if color:
             same = cand[cand["Цвет"] == color]
             cand = same if not same.empty else cand
         if cand.empty:
@@ -380,6 +373,15 @@ class InvoiceProcessor:
             else:
                 family = length = color = pd.NA  # безопасно
 
+            cat_row = _catalog[_catalog["code"] == art]
+            if not cat_row.empty:
+                cat_row = cat_row.iloc[0]
+                family = cat_row["family"]
+                length = cat_row["length_m"]
+                color = cat_row["color"]
+                if pd.isna(price):
+                    price = cat_row["price_rub"]
+
             left = self.stock.allocate_partial(art, need)
             shipped = need - left
 
@@ -450,24 +452,12 @@ class InvoiceProcessor:
         if "Комментарий" not in base.columns:
             base["Комментарий"] = ""
 
-        add_rows = [
+        add = [
             {c: r.get(c, "") for c in base.columns}
             for r in self.result_rows[len(self.df):]
         ]
-        if add_rows:
-            if (
-                "Всего" in base.columns
-                and self.col_price in base.columns
-                and self.col_qty in base.columns
-            ):
-                for r in add_rows:
-                    try:
-                        qty = float(str(r[self.col_qty]).replace(",", "."))
-                        pr = float(str(r[self.col_price]).replace(",", "."))
-                        r["Всего"] = round(qty * pr, 2)
-                    except Exception:
-                        pass  # оставляем пустым, если не удалось
-            base = pd.concat([base, pd.DataFrame(add_rows)], ignore_index=True)
+        if add:
+            base = pd.concat([base, pd.DataFrame(add)], ignore_index=True)
 
         base.to_excel(path, index=False)
         logging.info(f"Счёт сохранён в {path}")
