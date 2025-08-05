@@ -247,23 +247,12 @@ class StockManager:
         """Find analog item on stock matching family and length."""
 
         df = self.df
-
-        # базовый фильтр: по семейству, наличию и неиспользованным кодам
         cand = df[
             (df["Семейство"] == family)
             & (~df["Артикул"].isin(used))
-            & (df[self.stock_column] > 0)
+            & (df["Длина, м"].astype(float).sub(length).abs() <= 0.2)
         ]
 
-        # допускаем отклонение по длине не более 0.2 м
-        cand = cand[
-            pd.to_numeric(cand["Длина, м"], errors="coerce")
-            .sub(length)
-            .abs()
-            <= 0.2
-        ]
-
-        # цвет учитываем только если есть точные совпадения
         if _is_filled(color) and "Цвет" in cand.columns:
             same_color = cand[cand["Цвет"] == color]
             if not same_color.empty:
@@ -273,9 +262,7 @@ class StockManager:
             return None
 
         cand = cand.copy()
-        cand["price_diff"] = (
-            pd.to_numeric(cand["price_rub"], errors="coerce") - target_price
-        ).abs()
+        cand["price_diff"] = (cand["price_rub"] - target_price).abs()
         cand = cand.sort_values(["price_diff", self.stock_column], ascending=[True, False])
         return cand.iloc[0]
 
