@@ -13,6 +13,7 @@ import shutil
 import logging
 import re
 import unicodedata
+import argparse
 import pandas as pd
 
 def _is_filled(val) -> bool:
@@ -23,7 +24,10 @@ from flexy_catalog_loader import load_catalog
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from tkinter import Tk, filedialog, messagebox, Text, Scrollbar, Button, END
+try:  # GUI components are optional for CLI mode
+    from tkinter import Tk, filedialog, messagebox, Text, Scrollbar, Button, END
+except Exception:  # noqa: BLE001 - fine for environments without tkinter
+    Tk = filedialog = messagebox = Text = Scrollbar = Button = END = None
 
 # ──────────────────────── глобальная настройка ───────────────────
 logging.basicConfig(
@@ -158,10 +162,8 @@ class StockManager:
 
     # ────────────────────────────────────────────────────────────
     def load(self, path: str) -> None:
-        """Загружает остатки без поиска заголовков.
+        """Load stock file and enrich it with catalog data."""
 
-        Значения берутся из столбца B начиная с десятой строки.
-        """
         raw = pd.read_excel(path, header=None)
         qty = raw.iloc[FIXED_STOCK_ROW:, FIXED_STOCK_COL]
         articles = raw.iloc[FIXED_STOCK_ROW:, 0]
@@ -171,6 +173,8 @@ class StockManager:
         self.df.reset_index(drop=True, inplace=True)
 
         self.df["Артикул"] = self.df["Артикул"].astype(str).str.strip()
+        self.df["Остаток"] = pd.to_numeric(self.df["Остаток"], errors="coerce").fillna(0.0)
+
         cat = _catalog.copy()
         cat["code"] = cat["code"].astype(str).str.strip()
 
@@ -185,25 +189,24 @@ class StockManager:
                 }
             )
         )
-        self.df = self.df.merge(enrich, on="Артикул", how="left")
+        self.df = self.df.merge(enrich, on="Артикул", how="left", suffixes=("", "_cat"))
 
-        # устраняем возможные дубли «Семейство_x / Семейство_y» и т.п.
-        norm2orig = {}
-        for col in list(self.df.columns):
-            key = _normalize(col)
-            if key in norm2orig:
-                primary = norm2orig[key]
-                self.df[primary] = self.df[primary].fillna(self.df[col])
-                self.df.drop(columns=[col], inplace=True)
-            else:
-                norm2orig[key] = col
-
-        # гарантируем обязательные поля
+        # fill missing meta from catalog
         for col in ["Семейство", "Длина, м", "Цвет", "price_rub"]:
-            if col not in self.df.columns:
-                self.df[col] = pd.NA
+            cat_col = f"{col}_cat"
+            if cat_col in self.df.columns:
+                self.df[col] = self.df[col].fillna(self.df[cat_col])
+                self.df.drop(columns=[cat_col], inplace=True)
+            else:
+                if col not in self.df.columns:
+                    self.df[col] = pd.NA
+
+        # ensure numeric types
+        self.df["Длина, м"] = pd.to_numeric(self.df["Длина, м"], errors="coerce")
+        self.df["price_rub"] = pd.to_numeric(self.df["price_rub"], errors="coerce")
 
         self.stock_column = "Остаток"
+        self.df[self.stock_column] = self.df[self.stock_column].astype(float).fillna(0.0)
         logging.info(f"Загружено {len(self.df)} строк остатков")
 
         for col in ["Категория", "Цвет", "Покрытие", "Ширина"]:
@@ -211,6 +214,8 @@ class StockManager:
                 self.df[col] = pd.NA
 
     def allocate(self, article: str, qty: float) -> Optional[pd.Series]:
+        """Reserve ``qty`` items of ``article`` if available."""
+
         rows = self.df[self.df["Артикул"] == article]
         if not rows.empty:
             row = rows.iloc[0]
@@ -239,21 +244,39 @@ class StockManager:
         used: list[str],
         target_price: float,
     ) -> Optional[pd.Series]:
+        """Find analog item on stock matching family and length."""
+
         df = self.df
 
-        mask = (
+        # базовый фильтр: по семейству, наличию и неиспользованным кодам
+        cand = df[
             (df["Семейство"] == family)
-            & (df[self.stock_column] > 0)
             & (~df["Артикул"].isin(used))
-            & ((df["Длина, м"].astype(float) - length).abs() <= 0.05)
-        )
-        cand = df[mask]
+            & (df[self.stock_column] > 0)
+        ]
+
+        # допускаем отклонение по длине не более 0.2 м
+        cand = cand[
+            pd.to_numeric(cand["Длина, м"], errors="coerce")
+            .sub(length)
+            .abs()
+            <= 0.2
+        ]
+
+        # цвет учитываем только если есть точные совпадения
         if _is_filled(color) and "Цвет" in cand.columns:
-            same = cand[cand["Цвет"] == color]
-            cand = same if not same.empty else cand
+            same_color = cand[cand["Цвет"] == color]
+            if not same_color.empty:
+                cand = same_color
+
         if cand.empty:
             return None
-        cand = cand.iloc[(cand["price_rub"] - target_price).abs().argsort()]
+
+        cand = cand.copy()
+        cand["price_diff"] = (
+            pd.to_numeric(cand["price_rub"], errors="coerce") - target_price
+        ).abs()
+        cand = cand.sort_values(["price_diff", self.stock_column], ascending=[True, False])
         return cand.iloc[0]
 
 
@@ -347,6 +370,8 @@ class InvoiceProcessor:
 
     # ── основная логика ───────────────────────────────────────────
     def process(self) -> None:
+        """Process invoice rows using available stock and catalog."""
+
         self.used_analogs.clear()
         self.result_rows.clear()
         self.log.clear()
@@ -366,7 +391,7 @@ class InvoiceProcessor:
             need = row[self.col_qty]
             price = row.get(self.col_price, pd.NA)
 
-            # вытягиваем характеристики из Flexy-каталога
+            # характеристики из Flexy-каталога
             cat_row = _catalog[_catalog["code"] == art]
             if not cat_row.empty:
                 cat_row = cat_row.iloc[0]
@@ -376,16 +401,7 @@ class InvoiceProcessor:
                 if pd.isna(price):
                     price = cat_row["price_rub"]
             else:
-                family = length = color = pd.NA  # безопасно
-
-            cat_row = _catalog[_catalog["code"] == art]
-            if not cat_row.empty:
-                cat_row = cat_row.iloc[0]
-                family = cat_row["family"]
-                length = cat_row["length_m"]
-                color = cat_row["color"]
-                if pd.isna(price):
-                    price = cat_row["price_rub"]
+                family = length = color = pd.NA  # нет данных в каталоге
 
             left = self.stock.allocate_partial(art, need)
             shipped = need - left
@@ -413,6 +429,14 @@ class InvoiceProcessor:
                     used=self.used_analogs,
                     target_price=price,
                 )
+
+                if analog is None:
+                    alt_code = find_analog(art, length)  # глобальный fallback
+                    if alt_code:
+                        cand = self.stock.df[self.stock.df["Артикул"] == alt_code]
+                        if not cand.empty:
+                            analog = cand.iloc[0]
+
                 if analog is None or analog[self.stock.stock_column] < left:
                     self.log.append(f"{art}: аналогов нет")
                     continue
@@ -424,12 +448,16 @@ class InvoiceProcessor:
                 add[self.col_code] = analog["Артикул"]
                 add[self.col_qty] = left
                 add[self.col_price] = analog["price_rub"]
-                # копируем остальные поля из исходной строки (Товар, Ед., …)
                 for c in self.output_columns:
                     if add[c] == "" and c in row:
                         add[c] = row[c]
                 self.result_rows.append(add)
                 self.log.append(f"{art}: {left} шт → {analog['Артикул']}")
+
+        if not self.result_rows:
+            msg = "аналогов не найдено, счёт не изменён"
+            self.log.append(msg)
+            logging.info(msg)
 
     # ── вывод ─────────────────────────────────────────────────────
     def to_dataframe(self) -> pd.DataFrame:
@@ -444,9 +472,11 @@ class InvoiceProcessor:
         return df
 
     def save(self, path: str) -> None:
-        if not self.result_rows:
-            shutil.copyfile(self.invoice_path, path)
-            return
+        """Save processed invoice to ``path``.
+
+        Новый файл создаётся всегда. Колонка «Комментарий» добавляется,
+        если её не было в исходном счёте.
+        """
 
         base = pd.read_excel(
             self.invoice_path,
@@ -454,6 +484,7 @@ class InvoiceProcessor:
             header=0,
             dtype=str,
         )
+
         if "Комментарий" not in base.columns:
             base["Комментарий"] = ""
 
@@ -539,4 +570,21 @@ class App:
 
 # ────────────────────────── entry point ──────────────────────────
 if __name__ == "__main__":
-    App().run()
+    parser = argparse.ArgumentParser(description="Invoice Builder")
+    parser.add_argument("--cli", nargs=2, metavar=("STOCK", "INVOICE"), help="run without GUI")
+    args = parser.parse_args()
+
+    if args.cli:
+        stock_path, invoice_path = args.cli
+        stock = StockManager()
+        proc = InvoiceProcessor(stock=stock)
+        stock.load(stock_path)
+        proc.load(invoice_path)
+        proc.process()
+        base, _ = os.path.splitext(os.path.basename(invoice_path))
+        out_path = f"{base}_processed.xlsx"
+        proc.save(out_path)
+        for line in proc.log:
+            print(line)
+    else:
+        App().run()
