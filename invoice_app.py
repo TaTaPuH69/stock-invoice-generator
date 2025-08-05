@@ -249,7 +249,6 @@ class StockManager:
         df = self.df
         cand = df[
             (df["Семейство"] == family)
-            & (df[self.stock_column] > 0)
             & (~df["Артикул"].isin(used))
             & (df["Длина, м"].astype(float).sub(length).abs() <= 0.2)
         ]
