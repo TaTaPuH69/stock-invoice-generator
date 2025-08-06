@@ -190,6 +190,7 @@ class StockManager:
                 }
             )
         )
+
         self.df = self.df.merge(enrich, on="Артикул", how="left", suffixes=("", "_cat"))
 
         # fill missing meta from catalog
@@ -201,6 +202,10 @@ class StockManager:
             else:
                 if col not in self.df.columns:
                     self.df[col] = pd.NA
+
+        # ensure numeric types
+        self.df["Длина, м"] = pd.to_numeric(self.df["Длина, м"], errors="coerce")
+        self.df["price_rub"] = pd.to_numeric(self.df["price_rub"], errors="coerce")
 
         # ensure numeric types
         self.df["Длина, м"] = pd.to_numeric(self.df["Длина, м"], errors="coerce")
@@ -450,7 +455,6 @@ class InvoiceProcessor:
             msg = "аналогов не найдено, счёт не изменён"
             self.log.append(msg)
             logging.info(msg)
-
         if not self.result_rows:
             msg = "аналогов не найдено, счёт не изменён"
             self.log.append(msg)
