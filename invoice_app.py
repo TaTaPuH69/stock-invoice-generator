@@ -183,9 +183,10 @@ class StockManager:
             .rename(
                 columns={
                     "code": "Артикул",
-                    "family": "Семейство",
-                    "length_m": "Длина, м",
-                    "color": "Цвет",
+                    "family": "Семейство_cat",
+                    "length_m": "Длина, м_cat",
+                    "color": "Цвет_cat",
+                    "price_rub": "price_rub_cat",
                 }
             )
         )
@@ -200,6 +201,10 @@ class StockManager:
             else:
                 if col not in self.df.columns:
                     self.df[col] = pd.NA
+
+        # ensure numeric types
+        self.df["Длина, м"] = pd.to_numeric(self.df["Длина, м"], errors="coerce")
+        self.df["price_rub"] = pd.to_numeric(self.df["price_rub"], errors="coerce")
 
         # ensure numeric types
         self.df["Длина, м"] = pd.to_numeric(self.df["Длина, м"], errors="coerce")
@@ -425,7 +430,7 @@ class InvoiceProcessor:
                             analog = cand.iloc[0]
 
                 if analog is None or analog[self.stock.stock_column] < left:
-                    self.log.append(f"{art}: аналогов нет")
+                    self.log.append(f"{art} : аналогов нет")
                     continue
 
                 self.stock.allocate_partial(analog["Артикул"], left)
@@ -439,7 +444,12 @@ class InvoiceProcessor:
                     if add[c] == "" and c in row:
                         add[c] = row[c]
                 self.result_rows.append(add)
-                self.log.append(f"{art}: {left} шт → {analog['Артикул']}")
+                self.log.append(f"{art} : {left} шт → {analog['Артикул']}")
+
+        if not self.result_rows:
+            msg = "аналогов не найдено, счёт не изменён"
+            self.log.append(msg)
+            logging.info(msg)
 
         if not self.result_rows:
             msg = "аналогов не найдено, счёт не изменён"
