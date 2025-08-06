@@ -1,4 +1,3 @@
 pandas
 openpyxl
-camelot-py[cv]
-ghostscript
+fastparquet
