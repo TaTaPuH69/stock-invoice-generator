@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 import shutil
 import logging
+import sys
+from logging.handlers import RotatingFileHandler
 import re
 import unicodedata
 import argparse
@@ -24,17 +26,21 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 try:  # GUI components are optional for CLI mode
-    from tkinter import Tk, filedialog, messagebox, Text, Scrollbar, Button, END
+    from tkinter import Tk, filedialog, messagebox, Text, Scrollbar, Button, END, Toplevel
 except Exception:  # noqa: BLE001 - fine for environments without tkinter
-    Tk = filedialog = messagebox = Text = Scrollbar = Button = END = None
+    Tk = filedialog = messagebox = Text = Scrollbar = Button = END = Toplevel = None
 
 # ──────────────────────── глобальная настройка ───────────────────
-logging.basicConfig(
-    filename="app.log",
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s: %(message)s",
-    encoding="utf-8",
+logger = logging.getLogger("invoice")
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter(
+    "%(asctime)s  %(levelname)-8s  %(name)s: %(message)s"
 )
+file_handler = RotatingFileHandler(
+    "app.log", maxBytes=1_048_576, backupCount=5, encoding="utf-8"
+)
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
 
 VAT_RATE = 0.20
 _catalog = load_catalog()
@@ -216,7 +222,7 @@ class StockManager:
 
         self.stock_column = "Остаток"
         self.df[self.stock_column] = self.df[self.stock_column].astype(float).fillna(0.0)
-        logging.info(f"Загружено {len(self.df)} строк остатков")
+        logger.info(f"Загружено {len(self.df)} строк остатков")
 
         for col in ["Категория", "Цвет", "Покрытие", "Ширина"]:
             if col not in self.df.columns:
@@ -351,18 +357,18 @@ class InvoiceProcessor:
 
         dups = self.df[self.df.duplicated("Артикул")]
         if not dups.empty:
-            logging.warning(f"Дубликаты в счёте: {dups['Артикул'].tolist()}")
+            logger.warning(f"Дубликаты в счёте: {dups['Артикул'].tolist()}")
 
         if self.df["Цена"].notna().any():
             self.original_sum = (
                 self.df["Количество"] * self.df["Цена"]
             ).sum()
-            logging.info(
+            logger.info(
                 f"Загружен счёт на {self.original_sum:,.2f} ₽"
             )
         else:
             self.original_sum = 0.0
-            logging.info("Загружен счёт без цен")
+            logger.info("Загружен счёт без цен")
 
     # ── основная логика ───────────────────────────────────────────
     def process(self) -> None:
@@ -378,7 +384,7 @@ class InvoiceProcessor:
         if missing:
             msg = f"В счёте нет колонок: {', '.join(missing)}"
             self.log.append(msg)
-            logging.error(msg)
+            logger.error(msg)
             return
         # --------------------------------------------------------------------
 
@@ -453,11 +459,11 @@ class InvoiceProcessor:
         if not self.result_rows:
             msg = "аналогов не найдено, счёт не изменён"
             self.log.append(msg)
-            logging.info(msg)
+            logger.info(msg)
         if not self.result_rows:
             msg = "аналогов не найдено, счёт не изменён"
             self.log.append(msg)
-            logging.info(msg)
+            logger.info(msg)
 
     # ── вывод ─────────────────────────────────────────────────────
     def to_dataframe(self) -> pd.DataFrame:
@@ -496,7 +502,7 @@ class InvoiceProcessor:
             base = pd.concat([base, pd.DataFrame(add)], ignore_index=True)
 
         base.to_excel(path, index=False)
-        logging.info(f"Счёт сохранён в {path}")
+        logger.info(f"Счёт сохранён в {path}")
 
 
 
@@ -515,6 +521,8 @@ class App:
         Button(self.root, text="Загрузить остатки", command=self.load_stock).pack()
         Button(self.root, text="Загрузить счёт", command=self.load_invoice).pack()
         Button(self.root, text="Собрать счёт", command=self.build_invoice).pack()
+        Button(self.root, text="Посмотреть логи", command=self.view_logs).pack()
+        Button(self.root, text="Скачать логи", command=self.save_logs).pack()
 
         self.stock = StockManager()
         self.processor = InvoiceProcessor(stock=self.stock)
@@ -525,7 +533,28 @@ class App:
     def gui_log(self, msg: str) -> None:
         self.log_text.insert(END, msg + "\n")
         self.log_text.see(END)
-        logging.info(msg)
+        logger.info(msg)
+
+    def view_logs(self) -> None:
+        top = Toplevel(self.root)
+        top.title("Логи приложения")
+        txt = Text(top, width=100, height=40, font=("Consolas", 10))
+        txt.pack(fill="both", expand=True)
+        try:
+            with open("app.log", "r", encoding="utf-8") as f:
+                txt.insert("end", f.read())
+        except FileNotFoundError:
+            txt.insert("end", "Лог-файл не найден")
+        txt.config(state="disabled")
+
+    def save_logs(self) -> None:
+        dst = filedialog.asksaveasfilename(
+            defaultextension=".log",
+            filetypes=[("Log files", "*.log"), ("All files", "*.*")],
+        )
+        if dst:
+            shutil.copyfile("app.log", dst)
+            messagebox.showinfo("Логи сохранены", f"Файл сохранён: {dst}")
 
     # ── callbacks ────────────────────────────────────────────────
     def load_stock(self) -> None:
@@ -572,7 +601,21 @@ class App:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Invoice Builder")
     parser.add_argument("--cli", nargs=2, metavar=("STOCK", "INVOICE"), help="run without GUI")
+    parser.add_argument("--show-log", action="store_true", help="print last 100 log lines")
     args = parser.parse_args()
+
+    if args.cli or args.show_log:
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+
+    if args.show_log:
+        if os.path.exists("app.log"):
+            with open("app.log", "r", encoding="utf-8") as f:
+                lines = f.readlines()[-100:]
+            for line in lines:
+                print(line, end="")
+        sys.exit(0)
 
     if args.cli:
         stock_path, invoice_path = args.cli
