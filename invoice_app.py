@@ -190,18 +190,21 @@ class StockManager:
                 }
             )
         )
-        self.df = self.df.merge(enrich, on="Артикул", how="left")
+        self.df = self.df.merge(enrich, on="Артикул", how="left", suffixes=("", "_cat"))
 
+        # fill missing meta from catalog
         for col in ["Семейство", "Длина, м", "Цвет", "price_rub"]:
             cat_col = f"{col}_cat"
             if cat_col in self.df.columns:
-                if col in self.df.columns:
-                    self.df[col] = self.df[col].fillna(self.df[cat_col])
-                else:
-                    self.df[col] = self.df[cat_col]
+                self.df[col] = self.df[col].fillna(self.df[cat_col])
                 self.df.drop(columns=[cat_col], inplace=True)
-            elif col not in self.df.columns:
-                self.df[col] = pd.NA
+            else:
+                if col not in self.df.columns:
+                    self.df[col] = pd.NA
+
+        # ensure numeric types
+        self.df["Длина, м"] = pd.to_numeric(self.df["Длина, м"], errors="coerce")
+        self.df["price_rub"] = pd.to_numeric(self.df["price_rub"], errors="coerce")
 
         # ensure numeric types
         self.df["Длина, м"] = pd.to_numeric(self.df["Длина, м"], errors="coerce")
@@ -249,21 +252,10 @@ class StockManager:
         """Find analog item on stock matching family and length."""
 
         df = self.df
-
-        length = pd.to_numeric(length, errors="coerce")
-        target_price = pd.to_numeric(target_price, errors="coerce")
-
         cand = df[
             (df["Семейство"] == family)
             & (~df["Артикул"].isin(used))
-            & (pd.to_numeric(df[self.stock_column], errors="coerce") > 0)
-        ]
-
-        cand = cand[
-            pd.to_numeric(cand["Длина, м"], errors="coerce")
-            .sub(length)
-            .abs()
-            <= 0.2
+            & (df["Длина, м"].astype(float).sub(length).abs() <= 0.2)
         ]
 
         if _is_filled(color) and "Цвет" in cand.columns:
@@ -275,9 +267,7 @@ class StockManager:
             return None
 
         cand = cand.copy()
-        cand["price_diff"] = (
-            pd.to_numeric(cand["price_rub"], errors="coerce") - target_price
-        ).abs()
+        cand["price_diff"] = (cand["price_rub"] - target_price).abs()
         cand = cand.sort_values(["price_diff", self.stock_column], ascending=[True, False])
         return cand.iloc[0]
 
@@ -433,7 +423,7 @@ class InvoiceProcessor:
                 )
 
                 if analog is None:
-                    alt_code = find_analog(art, length)
+                    alt_code = find_analog(art, length)  # глобальный fallback
                     if alt_code:
                         cand = self.stock.df[self.stock.df["Артикул"] == alt_code]
                         if not cand.empty:
@@ -455,6 +445,11 @@ class InvoiceProcessor:
                         add[c] = row[c]
                 self.result_rows.append(add)
                 self.log.append(f"{art} : {left} шт → {analog['Артикул']}")
+
+        if not self.result_rows:
+            msg = "аналогов не найдено, счёт не изменён"
+            self.log.append(msg)
+            logging.info(msg)
 
         if not self.result_rows:
             msg = "аналогов не найдено, счёт не изменён"
