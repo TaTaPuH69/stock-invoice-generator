@@ -15,7 +15,6 @@ import re
 import unicodedata
 import argparse
 import pandas as pd
-
 def _is_filled(val) -> bool:
     """True, если val не None, не pd.NA и не пустая строка."""
     return pd.notna(val) and str(val).strip() != ""
