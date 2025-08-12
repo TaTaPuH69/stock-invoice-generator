@@ -22,6 +22,11 @@ def _is_filled(val) -> bool:
     return pd.notna(val) and str(val).strip() != ""
 
 from flexy_catalog_loader import load_catalog
+from analogs_loader import (
+    extract_base_code,
+    load_analog_rules,
+    RULES_DEFAULT_PATH,
+)
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -178,7 +183,10 @@ class StockManager:
         self.df.reset_index(drop=True, inplace=True)
 
         self.df["Артикул"] = self.df["Артикул"].astype(str).str.strip()
-        self.df["Остаток"] = pd.to_numeric(self.df["Остаток"], errors="coerce").fillna(0.0)
+        self.df["Остаток"] = (
+            pd.to_numeric(self.df["Остаток"], errors="coerce").fillna(0.0)
+        )
+        self.df["BaseCode"] = self.df["Артикул"].apply(lambda s: extract_base_code(str(s)))
 
         cat = _catalog.copy()
         cat["code"] = cat["code"].astype(str).str.strip()
@@ -251,6 +259,28 @@ class StockManager:
             self.df.at[row.name, self.stock_column] -= take
         return qty - take
 
+    def allocate_by_basecode(self, base_code: str, qty: float) -> list[tuple[pd.Series, float]]:
+        """
+        Списывает qty по позициям склада, где BaseCode==base_code,
+        игнорируя цвет/длину. Идём по строкам с наибольшим остатком.
+        Возвращает список (row, taken); остаток в self.df уменьшается.
+        """
+        allocs: list[tuple[pd.Series, float]] = []
+        rows = self.df[self.df["BaseCode"] == base_code]
+        rows = rows.sort_values(self.stock_column, ascending=False)
+        for _, r in rows.iterrows():
+            if qty <= 0:
+                break
+            avail = r[self.stock_column]
+            if avail <= 0:
+                continue
+            take = min(avail, qty)
+            if take > 0:
+                self.df.at[r.name, self.stock_column] -= take
+                qty -= take
+                allocs.append((r, take))
+        return allocs
+
     def find_analog(
         self,
         family: str,
@@ -286,6 +316,7 @@ class StockManager:
 @dataclass
 class InvoiceProcessor:
     stock: StockManager
+    app: Optional["App"] = None
     df: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     original_sum: float = 0.0
@@ -424,6 +455,35 @@ class InvoiceProcessor:
 
             # ----- если нужен аналог -----
             if left:
+                base_code = extract_base_code(art)
+                candidates = (
+                    self.app.rules.get(base_code, []) if self.app else []
+                )
+                if candidates:
+                    for cand_base in candidates:
+                        allocs = self.stock.allocate_by_basecode(cand_base, left)
+                        for r, taken in allocs:
+                            add = {c: "" for c in self.output_columns}
+                            add[self.col_code] = r["Артикул"]
+                            add[self.col_qty] = taken
+                            price_val = r.get("price_rub", price)
+                            if pd.notna(price_val):
+                                add[self.col_price] = price_val
+                            for c in self.output_columns:
+                                if add[c] == "" and c in row:
+                                    add[c] = row[c]
+                            self.result_rows.append(add)
+                            self.log.append(
+                                f"{art}: {taken} шт → {r['Артикул']} (по правилам)"
+                            )
+                            self.used_analogs.append(r["Артикул"])
+                            left -= taken
+                        if left <= 0:
+                            break
+                    if left > 0:
+                        self.log.append(f"{art}: аналогов нет по правилам")
+                    continue
+
                 analog = self.stock.find_analog(
                     family=family,
                     length=length,
@@ -521,11 +581,19 @@ class App:
         Button(self.root, text="Загрузить остатки", command=self.load_stock).pack()
         Button(self.root, text="Загрузить счёт", command=self.load_invoice).pack()
         Button(self.root, text="Собрать счёт", command=self.build_invoice).pack()
+        Button(self.root, text="Загрузить правила", command=self.load_rules).pack()
         Button(self.root, text="Посмотреть логи", command=self.view_logs).pack()
         Button(self.root, text="Скачать логи", command=self.save_logs).pack()
 
         self.stock = StockManager()
-        self.processor = InvoiceProcessor(stock=self.stock)
+        self.rules: dict[str, list[str]] = {}
+        try:
+            self.rules = load_analog_rules(RULES_DEFAULT_PATH)
+            logger.info(f"Правила загружены: {len(self.rules)} баз")
+        except FileNotFoundError:
+            logger.info("Правила не найдены")
+
+        self.processor = InvoiceProcessor(stock=self.stock, app=self)
         self.stock_file: Optional[str] = None
         self.invoice_file: Optional[str] = None
 
@@ -579,6 +647,17 @@ class App:
         except Exception as exc:
             messagebox.showerror("Ошибка", str(exc))
 
+    def load_rules(self) -> None:
+        path = filedialog.askopenfilename()
+        if not path:
+            return
+        try:
+            self.rules = load_analog_rules(path)
+            self.gui_log(f"Правила загружены: {len(self.rules)} баз")
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Ошибка", str(exc))
+        self.processor.app = self
+
     def build_invoice(self) -> None:
         if self.stock.df.empty or self.processor.df.empty:
             messagebox.showwarning("Внимание", "Загрузите остатки и счёт")
@@ -602,6 +681,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Invoice Builder")
     parser.add_argument("--cli", nargs=2, metavar=("STOCK", "INVOICE"), help="run without GUI")
     parser.add_argument("--show-log", action="store_true", help="print last 100 log lines")
+    parser.add_argument("--rules", help="path to analog rules file")
     args = parser.parse_args()
 
     if args.cli or args.show_log:
@@ -620,7 +700,15 @@ if __name__ == "__main__":
     if args.cli:
         stock_path, invoice_path = args.cli
         stock = StockManager()
-        proc = InvoiceProcessor(stock=stock)
+        rules_path = args.rules or RULES_DEFAULT_PATH
+        try:
+            rules = load_analog_rules(rules_path)
+            logger.info(f"Правила загружены: {len(rules)} баз")
+        except FileNotFoundError:
+            rules = {}
+            logger.info("Правила не найдены")
+        dummy_app = type("Dummy", (), {"rules": rules})()
+        proc = InvoiceProcessor(stock=stock, app=dummy_app)
         stock.load(stock_path)
         proc.load(invoice_path)
         proc.process()
@@ -630,4 +718,12 @@ if __name__ == "__main__":
         for line in proc.log:
             print(line)
     else:
-        App().run()
+        app = App()
+        if args.rules:
+            try:
+                app.rules = load_analog_rules(args.rules)
+                logger.info(f"Правила загружены: {len(app.rules)} баз")
+            except FileNotFoundError:
+                logger.info("Правила не найдены")
+        app.processor.app = app
+        app.run()
