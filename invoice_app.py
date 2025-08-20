@@ -21,20 +21,11 @@ def _is_filled(val) -> bool:
     return pd.notna(val) and str(val).strip() != ""
 
 from flexy_catalog_loader import load_catalog
-import logging
-logger = logging.getLogger("invoice")
-try:
-    from analogs_loader import extract_base_code, load_analog_rules, RULES_DEFAULT_PATH
-except Exception:  # noqa: BLE001
-    import re
-    RULES_DEFAULT_PATH = "analogs_priority.xlsx"
-
-    def extract_base_code(s: str) -> str:
-        m = re.search(r"\d{4,6}", str(s))
-        return m.group(0) if m else ""
-
-    def load_analog_rules(path: str = RULES_DEFAULT_PATH):
-        return {}
+from analogs_loader import (
+    extract_base_code,
+    load_analog_rules,
+    RULES_DEFAULT_PATH,
+)
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -188,8 +179,28 @@ class StockManager:
         self.df.reset_index(drop=True, inplace=True)
 
         self.df["Артикул"] = self.df["Артикул"].astype(str).str.strip()
-        self.df["Остаток"] = pd.to_numeric(self.df["Остаток"], errors="coerce").fillna(0)
-        self.df["BaseCode"] = self.df["Артикул"].map(extract_base_code)
+        self.df["Остаток"] = (
+            pd.to_numeric(self.df["Остаток"], errors="coerce").fillna(0.0)
+        )
+        self.df["BaseCode"] = self.df["Артикул"].apply(lambda s: extract_base_code(str(s)))
+
+        cat = _catalog.copy()
+        cat["code"] = cat["code"].astype(str).str.strip()
+
+        enrich = (
+            cat[["code", "family", "length_m", "color", "price_rub"]]
+            .rename(
+                columns={
+                    "code": "Артикул",
+                    "family": "Семейство_cat",
+                    "length_m": "Длина, м_cat",
+                    "color": "Цвет_cat",
+                    "price_rub": "price_rub_cat",
+                }
+            )
+        )
+
+        self.df = self.df.merge(enrich, on="Артикул", how="left", suffixes=("", "_cat"))
 
         if isinstance(_catalog, pd.DataFrame) and {"code", "price_rub"} <= set(_catalog.columns):
             cat = _catalog.copy()
@@ -230,29 +241,25 @@ class StockManager:
 
     def allocate_by_basecode(self, base_code: str, qty: float) -> list[tuple[pd.Series, float]]:
         """
-        Списывает qty по позициям, где BaseCode == base_code.
-        Цвет/длина игнорируются. Берём строки с наибольшим остатком.
-        Возвращает список (row, taken). Остаток уменьшает в self.df.
+        Списывает qty по позициям склада, где BaseCode==base_code,
+        игнорируя цвет/длину. Идём по строкам с наибольшим остатком.
+        Возвращает список (row, taken); остаток в self.df уменьшается.
         """
-        df = self.df
-        if "BaseCode" not in df.columns:
-            return []
-        pool = df[(df["BaseCode"] == base_code) & (df[self.stock_column] > 0)].copy()
-        if pool.empty:
-            return []
-        pool = pool.sort_values(self.stock_column, ascending=False)
-        left = float(qty)
-        out: list[tuple[pd.Series, float]] = []
-        for idx, row in pool.iterrows():
-            if left <= 0:
+        allocs: list[tuple[pd.Series, float]] = []
+        rows = self.df[self.df["BaseCode"] == base_code]
+        rows = rows.sort_values(self.stock_column, ascending=False)
+        for _, r in rows.iterrows():
+            if qty <= 0:
                 break
-            avail = float(row[self.stock_column])
-            take = min(avail, left)
+            avail = r[self.stock_column]
+            if avail <= 0:
+                continue
+            take = min(avail, qty)
             if take > 0:
-                self.df.at[idx, self.stock_column] = avail - take
-                out.append((row, take))
-                left -= take
-        return out
+                self.df.at[r.name, self.stock_column] -= take
+                qty -= take
+                allocs.append((r, take))
+        return allocs
 
     def find_analog(
         self,
@@ -422,12 +429,42 @@ class InvoiceProcessor:
                 self.result_rows.append(base)
 
             # ----- если нужен аналог -----
-            if left > 0:
-                base = extract_base_code(art)
-                cand_bases = (
-                    self.app.rules.get(base, [])
-                    if hasattr(self, "app") and getattr(self.app, "rules", None)
-                    else []
+            if left:
+                base_code = extract_base_code(art)
+                candidates = (
+                    self.app.rules.get(base_code, []) if self.app else []
+                )
+                if candidates:
+                    for cand_base in candidates:
+                        allocs = self.stock.allocate_by_basecode(cand_base, left)
+                        for r, taken in allocs:
+                            add = {c: "" for c in self.output_columns}
+                            add[self.col_code] = r["Артикул"]
+                            add[self.col_qty] = taken
+                            price_val = r.get("price_rub", price)
+                            if pd.notna(price_val):
+                                add[self.col_price] = price_val
+                            for c in self.output_columns:
+                                if add[c] == "" and c in row:
+                                    add[c] = row[c]
+                            self.result_rows.append(add)
+                            self.log.append(
+                                f"{art}: {taken} шт → {r['Артикул']} (по правилам)"
+                            )
+                            self.used_analogs.append(r["Артикул"])
+                            left -= taken
+                        if left <= 0:
+                            break
+                    if left > 0:
+                        self.log.append(f"{art}: аналогов нет по правилам")
+                    continue
+
+                analog = self.stock.find_analog(
+                    family=family,
+                    length=length,
+                    color=color,
+                    used=self.used_analogs,
+                    target_price=price,
                 )
                 for b in cand_bases:
                     if left <= 0:
@@ -529,12 +566,10 @@ class App:
         self.stock = StockManager()
         self.rules: dict[str, list[str]] = {}
         try:
-            import os
-            if os.path.exists(RULES_DEFAULT_PATH):
-                self.rules = load_analog_rules(RULES_DEFAULT_PATH)
-                self.gui_log(f"Правила загружены: {len(self.rules)} баз (авто)")
-        except Exception:  # noqa: BLE001
-            logger.exception("Автозагрузка правил не удалась")
+            self.rules = load_analog_rules(RULES_DEFAULT_PATH)
+            logger.info(f"Правила загружены: {len(self.rules)} баз")
+        except FileNotFoundError:
+            logger.info("Правила не найдены")
 
         self.processor = InvoiceProcessor(stock=self.stock, app=self)
         self.stock_file: Optional[str] = None
