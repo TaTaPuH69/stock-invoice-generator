@@ -63,7 +63,6 @@ file_handler = RotatingFileHandler(
 )
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
-
 VAT_RATE = 0.20
 _catalog = load_catalog()
 
