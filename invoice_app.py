@@ -8,6 +8,24 @@ Invoice Builder GUI
 # ──────────────────────────── imports ────────────────────────────
 from __future__ import annotations
 
+import sys, logging
+from logging.handlers import RotatingFileHandler
+logger = logging.getLogger("invoice")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    _fmt = logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  %(name)s: %(message)s"
+    )
+    _fh = RotatingFileHandler(
+        "app.log", maxBytes=1_048_576, backupCount=5, encoding="utf-8"
+    )
+    _fh.setFormatter(_fmt)
+    logger.addHandler(_fh)
+    _sh = logging.StreamHandler(sys.stdout)
+    _sh.setFormatter(_fmt)
+    logger.addHandler(_sh)
+    logger.propagate = False
+
 import os
 import shutil
 import sys
@@ -16,6 +34,7 @@ import re
 import unicodedata
 import argparse
 import pandas as pd
+
 def _is_filled(val) -> bool:
     """True, если val не None, не pd.NA и не пустая строка."""
     return pd.notna(val) and str(val).strip() != ""
@@ -662,11 +681,6 @@ if __name__ == "__main__":
     parser.add_argument("--show-log", action="store_true", help="print last 100 log lines")
     parser.add_argument("--rules", help="path to analog rules file")
     args = parser.parse_args()
-
-    if args.cli or args.show_log:
-        stream_handler = logging.StreamHandler(sys.stdout)
-        stream_handler.setFormatter(formatter)
-        logger.addHandler(stream_handler)
 
     if args.show_log:
         if os.path.exists("app.log"):
