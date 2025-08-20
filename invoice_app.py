@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import logging
 import sys
 from logging.handlers import RotatingFileHandler
 import re
@@ -22,6 +21,20 @@ def _is_filled(val) -> bool:
     return pd.notna(val) and str(val).strip() != ""
 
 from flexy_catalog_loader import load_catalog
+import logging
+logger = logging.getLogger("invoice")
+try:
+    from analogs_loader import extract_base_code, load_analog_rules, RULES_DEFAULT_PATH
+except Exception:  # noqa: BLE001
+    import re
+    RULES_DEFAULT_PATH = "analogs_priority.xlsx"
+
+    def extract_base_code(s: str) -> str:
+        m = re.search(r"\d{4,6}", str(s))
+        return m.group(0) if m else ""
+
+    def load_analog_rules(path: str = RULES_DEFAULT_PATH):
+        return {}
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -31,7 +44,6 @@ except Exception:  # noqa: BLE001 - fine for environments without tkinter
     Tk = filedialog = messagebox = Text = Scrollbar = Button = END = Toplevel = None
 
 # ──────────────────────── глобальная настройка ───────────────────
-logger = logging.getLogger("invoice")
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter(
     "%(asctime)s  %(levelname)-8s  %(name)s: %(message)s"
@@ -167,8 +179,6 @@ class StockManager:
 
     # ────────────────────────────────────────────────────────────
     def load(self, path: str) -> None:
-        """Load stock file and enrich it with catalog data."""
-
         raw = pd.read_excel(path, header=None)
         qty = raw.iloc[FIXED_STOCK_ROW:, FIXED_STOCK_COL]
         articles = raw.iloc[FIXED_STOCK_ROW:, 0]
@@ -178,55 +188,22 @@ class StockManager:
         self.df.reset_index(drop=True, inplace=True)
 
         self.df["Артикул"] = self.df["Артикул"].astype(str).str.strip()
-        self.df["Остаток"] = pd.to_numeric(self.df["Остаток"], errors="coerce").fillna(0.0)
+        self.df["Остаток"] = pd.to_numeric(self.df["Остаток"], errors="coerce").fillna(0)
+        self.df["BaseCode"] = self.df["Артикул"].map(extract_base_code)
 
-        cat = _catalog.copy()
-        cat["code"] = cat["code"].astype(str).str.strip()
+        if isinstance(_catalog, pd.DataFrame) and {"code", "price_rub"} <= set(_catalog.columns):
+            cat = _catalog.copy()
+            cat["code"] = cat["code"].astype(str).str.strip()
+            enrich = cat[["code", "price_rub"]].rename(columns={"code": "Артикул"})
+            enrich["price_rub"] = pd.to_numeric(enrich["price_rub"], errors="coerce")
+            self.df = self.df.merge(enrich, on="Артикул", how="left")
 
-        enrich = (
-            cat[["code", "family", "length_m", "color", "price_rub"]]
-            .rename(
-                columns={
-                    "code": "Артикул",
-                    "family": "Семейство_cat",
-                    "length_m": "Длина, м_cat",
-                    "color": "Цвет_cat",
-                    "price_rub": "price_rub_cat",
-                }
-            )
-        )
-
-        self.df = self.df.merge(enrich, on="Артикул", how="left", suffixes=("", "_cat"))
-
-        # fill missing meta from catalog
-        for col in ["Семейство", "Длина, м", "Цвет", "price_rub"]:
-            cat_col = f"{col}_cat"
-            if cat_col in self.df.columns:
-                self.df[col] = self.df[col].fillna(self.df[cat_col])
-                self.df.drop(columns=[cat_col], inplace=True)
-            else:
-                if col not in self.df.columns:
-                    self.df[col] = pd.NA
-
-        # ensure numeric types
-        self.df["Длина, м"] = pd.to_numeric(self.df["Длина, м"], errors="coerce")
-        self.df["price_rub"] = pd.to_numeric(self.df["price_rub"], errors="coerce")
-
-        # ensure numeric types
-        self.df["Длина, м"] = pd.to_numeric(self.df["Длина, м"], errors="coerce")
-        self.df["price_rub"] = pd.to_numeric(self.df["price_rub"], errors="coerce")
-
-        # ensure numeric types
-        self.df["Длина, м"] = pd.to_numeric(self.df["Длина, м"], errors="coerce")
-        self.df["price_rub"] = pd.to_numeric(self.df["price_rub"], errors="coerce")
+        for c in ["Семейство", "Длина, м", "Цвет", "price_rub"]:
+            if c not in self.df.columns:
+                self.df[c] = pd.NA
 
         self.stock_column = "Остаток"
-        self.df[self.stock_column] = self.df[self.stock_column].astype(float).fillna(0.0)
         logger.info(f"Загружено {len(self.df)} строк остатков")
-
-        for col in ["Категория", "Цвет", "Покрытие", "Ширина"]:
-            if col not in self.df.columns:
-                self.df[col] = pd.NA
 
     def allocate(self, article: str, qty: float) -> Optional[pd.Series]:
         """Reserve ``qty`` items of ``article`` if available."""
@@ -250,6 +227,32 @@ class StockManager:
         if take > 0:
             self.df.at[row.name, self.stock_column] -= take
         return qty - take
+
+    def allocate_by_basecode(self, base_code: str, qty: float) -> list[tuple[pd.Series, float]]:
+        """
+        Списывает qty по позициям, где BaseCode == base_code.
+        Цвет/длина игнорируются. Берём строки с наибольшим остатком.
+        Возвращает список (row, taken). Остаток уменьшает в self.df.
+        """
+        df = self.df
+        if "BaseCode" not in df.columns:
+            return []
+        pool = df[(df["BaseCode"] == base_code) & (df[self.stock_column] > 0)].copy()
+        if pool.empty:
+            return []
+        pool = pool.sort_values(self.stock_column, ascending=False)
+        left = float(qty)
+        out: list[tuple[pd.Series, float]] = []
+        for idx, row in pool.iterrows():
+            if left <= 0:
+                break
+            avail = float(row[self.stock_column])
+            take = min(avail, left)
+            if take > 0:
+                self.df.at[idx, self.stock_column] = avail - take
+                out.append((row, take))
+                left -= take
+        return out
 
     def find_analog(
         self,
@@ -286,6 +289,7 @@ class StockManager:
 @dataclass
 class InvoiceProcessor:
     stock: StockManager
+    app: Optional["App"] = None
     df: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     original_sum: float = 0.0
@@ -397,13 +401,8 @@ class InvoiceProcessor:
             cat_row = _catalog[_catalog["code"] == art]
             if not cat_row.empty:
                 cat_row = cat_row.iloc[0]
-                family = cat_row["family"]
-                length = float(cat_row["length_m"])
-                color = cat_row["color"]
                 if pd.isna(price):
                     price = cat_row["price_rub"]
-            else:
-                family = length = color = pd.NA  # нет данных в каталоге
 
             left = self.stock.allocate_partial(art, need)
             shipped = need - left
@@ -423,38 +422,40 @@ class InvoiceProcessor:
                 self.result_rows.append(base)
 
             # ----- если нужен аналог -----
-            if left:
-                analog = self.stock.find_analog(
-                    family=family,
-                    length=length,
-                    color=color,
-                    used=self.used_analogs,
-                    target_price=price,
+            if left > 0:
+                base = extract_base_code(art)
+                cand_bases = (
+                    self.app.rules.get(base, [])
+                    if hasattr(self, "app") and getattr(self.app, "rules", None)
+                    else []
                 )
-
-                if analog is None:
-                    alt_code = find_analog(art, length)  # глобальный fallback
-                    if alt_code:
-                        cand = self.stock.df[self.stock.df["Артикул"] == alt_code]
-                        if not cand.empty:
-                            analog = cand.iloc[0]
-
-                if analog is None or analog[self.stock.stock_column] < left:
-                    self.log.append(f"{art} : аналогов нет")
-                    continue
-
-                self.stock.allocate_partial(analog["Артикул"], left)
-                self.used_analogs.append(analog["Артикул"])
-
-                add = {c: "" for c in self.output_columns}
-                add[self.col_code] = analog["Артикул"]
-                add[self.col_qty] = left
-                add[self.col_price] = analog["price_rub"]
-                for c in self.output_columns:
-                    if add[c] == "" and c in row:
-                        add[c] = row[c]
-                self.result_rows.append(add)
-                self.log.append(f"{art} : {left} шт → {analog['Артикул']}")
+                for b in cand_bases:
+                    if left <= 0:
+                        break
+                    allocs = self.stock.allocate_by_basecode(b, left)
+                    for r, taken in allocs:
+                        add = {c: "" for c in self.output_columns}
+                        add[self.col_code] = r["Артикул"]
+                        add[self.col_qty] = taken
+                        price_src = r.get("price_rub")
+                        if pd.notna(price_src):
+                            add[self.col_price] = float(price_src)
+                        elif pd.notna(price):
+                            add[self.col_price] = float(price)
+                        for c in self.output_columns:
+                            if add[c] == "" and c in row:
+                                add[c] = row[c]
+                        self.result_rows.append(add)
+                        left -= taken
+                        self.log.append(
+                            f"{art}: {taken} шт → {r['Артикул']} (по правилам)"
+                        )
+                if left > 0 and not cand_bases:
+                    self.log.append(f"{art}: аналогов нет по правилам")
+                elif left > 0 and cand_bases:
+                    self.log.append(
+                        f"{art}: не хватило {left} шт — аналоги по правилам закончились"
+                    )
 
         if not self.result_rows:
             msg = "аналогов не найдено, счёт не изменён"
@@ -521,11 +522,21 @@ class App:
         Button(self.root, text="Загрузить остатки", command=self.load_stock).pack()
         Button(self.root, text="Загрузить счёт", command=self.load_invoice).pack()
         Button(self.root, text="Собрать счёт", command=self.build_invoice).pack()
+        Button(self.root, text="Загрузить правила", command=self.load_rules).pack()
         Button(self.root, text="Посмотреть логи", command=self.view_logs).pack()
         Button(self.root, text="Скачать логи", command=self.save_logs).pack()
 
         self.stock = StockManager()
-        self.processor = InvoiceProcessor(stock=self.stock)
+        self.rules: dict[str, list[str]] = {}
+        try:
+            import os
+            if os.path.exists(RULES_DEFAULT_PATH):
+                self.rules = load_analog_rules(RULES_DEFAULT_PATH)
+                self.gui_log(f"Правила загружены: {len(self.rules)} баз (авто)")
+        except Exception:  # noqa: BLE001
+            logger.exception("Автозагрузка правил не удалась")
+
+        self.processor = InvoiceProcessor(stock=self.stock, app=self)
         self.stock_file: Optional[str] = None
         self.invoice_file: Optional[str] = None
 
@@ -565,8 +576,9 @@ class App:
             self.stock.load(path)
             self.stock_file = path
             self.gui_log(f"Остатки загружены: {len(self.stock.df)} строк")
-        except Exception as e:
-            messagebox.showerror("Ошибка", str(e))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Ошибка при загрузке остатков")
+            messagebox.showerror("Ошибка", f"{type(exc).__name__}: {exc}")
 
     def load_invoice(self) -> None:
         path = filedialog.askopenfilename()
@@ -578,6 +590,17 @@ class App:
             self.gui_log(f"Счёт загружен: {len(self.processor.df)} строк")
         except Exception as exc:
             messagebox.showerror("Ошибка", str(exc))
+
+    def load_rules(self) -> None:
+        path = filedialog.askopenfilename()
+        if not path:
+            return
+        try:
+            self.rules = load_analog_rules(path)
+            self.gui_log(f"Правила загружены: {len(self.rules)} баз")
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Ошибка", str(exc))
+        self.processor.app = self
 
     def build_invoice(self) -> None:
         if self.stock.df.empty or self.processor.df.empty:
@@ -602,6 +625,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Invoice Builder")
     parser.add_argument("--cli", nargs=2, metavar=("STOCK", "INVOICE"), help="run without GUI")
     parser.add_argument("--show-log", action="store_true", help="print last 100 log lines")
+    parser.add_argument("--rules", help="path to analog rules file")
     args = parser.parse_args()
 
     if args.cli or args.show_log:
@@ -620,7 +644,15 @@ if __name__ == "__main__":
     if args.cli:
         stock_path, invoice_path = args.cli
         stock = StockManager()
-        proc = InvoiceProcessor(stock=stock)
+        rules_path = args.rules or RULES_DEFAULT_PATH
+        try:
+            rules = load_analog_rules(rules_path)
+            logger.info(f"Правила загружены: {len(rules)} баз")
+        except FileNotFoundError:
+            rules = {}
+            logger.info("Правила не найдены")
+        dummy_app = type("Dummy", (), {"rules": rules})()
+        proc = InvoiceProcessor(stock=stock, app=dummy_app)
         stock.load(stock_path)
         proc.load(invoice_path)
         proc.process()
@@ -630,4 +662,12 @@ if __name__ == "__main__":
         for line in proc.log:
             print(line)
     else:
-        App().run()
+        app = App()
+        if args.rules:
+            try:
+                app.rules = load_analog_rules(args.rules)
+                logger.info(f"Правила загружены: {len(app.rules)} баз")
+            except FileNotFoundError:
+                logger.info("Правила не найдены")
+        app.processor.app = app
+        app.run()
