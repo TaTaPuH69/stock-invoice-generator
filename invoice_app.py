@@ -8,84 +8,61 @@ Invoice Builder GUI
 # ──────────────────────────── imports ────────────────────────────
 from __future__ import annotations
 
-import sys, logging
-from logging.handlers import RotatingFileHandler
-logger = logging.getLogger("invoice")
-if not logger.handlers:
-    logger.setLevel(logging.INFO)
-    _fmt = logging.Formatter(
-        "%(asctime)s  %(levelname)-8s  %(name)s: %(message)s"
-    )
-    _fh = RotatingFileHandler(
-        "app.log", maxBytes=1_048_576, backupCount=5, encoding="utf-8"
-    )
-    _fh.setFormatter(_fmt)
-    logger.addHandler(_fh)
-    _sh = logging.StreamHandler(sys.stdout)
-    _sh.setFormatter(_fmt)
-    logger.addHandler(_sh)
-    logger.propagate = False
-
 import os
-import shutil
 import sys
+import shutil
+import logging
 from logging.handlers import RotatingFileHandler
 import re
 import unicodedata
 import argparse
-import pandas as pd
+from dataclasses import dataclass, field
+from typing import List, Optional
 
+import pandas as pd
+from flexy_catalog_loader import load_catalog
+
+try:  # GUI components are optional for CLI mode
+    from tkinter import Tk, filedialog, messagebox, Text, Scrollbar, Button, END, Toplevel
+except Exception:  # noqa: BLE001
+    Tk = filedialog = messagebox = Text = Scrollbar = Button = END = Toplevel = None
+
+# ──────────────────────── logging ────────────────────────────────
+logger = logging.getLogger("invoice")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    _fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(name)s: %(message)s")
+    _fh = RotatingFileHandler("app.log", maxBytes=1_048_576, backupCount=5, encoding="utf-8")
+    _fh.setFormatter(_fmt)
+    _sh = logging.StreamHandler(sys.stdout)
+    _sh.setFormatter(_fmt)
+    logger.addHandler(_fh)
+    logger.addHandler(_sh)
+    logger.propagate = False
+
+# ──────────────────────── const / catalog ────────────────────────
+VAT_RATE = 0.20
+RULES_DEFAULT_PATH = "analogs_priority.xlsx"
+_catalog = load_catalog()
+
+# ───────────────────────── util functions ────────────────────────
 def _is_filled(val) -> bool:
     """True, если val не None, не pd.NA и не пустая строка."""
     return pd.notna(val) and str(val).strip() != ""
 
-from flexy_catalog_loader import load_catalog
-from analogs_loader import (
-    extract_base_code,
-    load_analog_rules,
-    RULES_DEFAULT_PATH,
-)
-from dataclasses import dataclass, field
-from typing import List, Optional
-
-try:  # GUI components are optional for CLI mode
-    from tkinter import Tk, filedialog, messagebox, Text, Scrollbar, Button, END, Toplevel
-except Exception:  # noqa: BLE001 - fine for environments without tkinter
-    Tk = filedialog = messagebox = Text = Scrollbar = Button = END = Toplevel = None
-
-# ──────────────────────── глобальная настройка ───────────────────
-logger.setLevel(logging.INFO)
-formatter = logging.Formatter(
-    "%(asctime)s  %(levelname)-8s  %(name)s: %(message)s"
-)
-file_handler = RotatingFileHandler(
-    "app.log", maxBytes=1_048_576, backupCount=5, encoding="utf-8"
-)
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
-VAT_RATE = 0.20
-_catalog = load_catalog()
-
-# ─── util: нормализуем имя колонки ───
 def _normalize(col: str) -> str:
-    """
-    Приводит заголовок столбца к унифицированному виду:
-    • lower()         – без регистра
-    • удаляем пробелы, «-», табы и переводы строк
-    • ё → е
-    """
+    """Нормализуем заголовок столбца (нижний регистр, убираем пробелы/дефисы/переводы)."""
     return (
         str(col)
         .lower()
-        .replace("\n", "")      # NEW: убираем перевод строки
-        .replace("\r", "")      #         "
-        .replace("\t", "")      #         "
-        .replace(" ", "")       # было
-        .replace("-", "")       # было
-        .replace("ё", "е")      # было
+        .replace("\n", "")
+        .replace("\r", "")
+        .replace("\t", "")
+        .replace(" ", "")
+        .replace("-", "")
+        .replace("ё", "е")
     )
 
-# ── поиск строки с заголовками в счёте ───────────────────────────
 def _find_header_row(path: str, max_row: int = 40) -> int:
     """Возвращает индекс строки с заголовками таблицы счёта."""
     for i in range(max_row):
@@ -97,83 +74,73 @@ def _find_header_row(path: str, max_row: int = 40) -> int:
             return i
     raise ValueError("Header row not found")
 
-# ─── настройка «жёстких» координат ───
-FIXED_STOCK_ROW = 9   # B10 → 10-я строка  ➜  index 9
-FIXED_STOCK_COL = 1   # B  → второй столбец ➜  index 1
-# ──────────────────────────────────────
+# фиксированные координаты для выгрузки остатков (если формат жёсткий)
+FIXED_STOCK_ROW = 9   # с 10-й строки (0-based index 9)
+FIXED_STOCK_COL = 1   # второй столбец (B)
 
+def extract_base_code(s: str) -> str:
+    """Возвращает базовый код (первые 4–6 цифр) из артикула/строки."""
+    m = re.search(r"\d{4,6}", str(s))
+    return m.group(0) if m else ""
 
-# ─── read_table (берём 2-й столбец с 10-й строки) ───
-def read_table(path: str) -> pd.DataFrame:
+def load_analog_rules(path: str = RULES_DEFAULT_PATH) -> dict[str, list[str]]:
     """
-    Читает Excel / CSV-файл и возвращает DataFrame
-    ▸ Excel: пропускаем первые 9 строк (0-based => строка 10),
-      берём все данные без заголовка.
-    ▸ CSV: то же самое (skiprows=9, без header).
-    Оставляем два столбца: первый (артикул / наименование)
-    и второй — количество (переименуем в 'Остаток').
+    Читает файл правил analogs_priority.xlsx и строит словарь:
+    base_code -> [base_code_analogue_1, base_code_analogue_2, ...]
+    Порядок в списке = приоритет подстановки.
     """
-    _, ext = os.path.splitext(path)
+    if not os.path.exists(path):
+        return {}
+    df = pd.read_excel(path, dtype=str).fillna("")
 
-    kw_args = dict(dtype=str, header=None, skiprows=9)
+    def norm(x: str) -> str:
+        return str(x).strip().lower().replace(" ", "")
 
-    if ext.lower() in (".xls", ".xlsx"):
-        df = pd.read_excel(path, **kw_args)
-    else:
-        df = pd.read_csv(path, sep=";", **kw_args)
+    # Определяем колонку "базы" (первая подходящая)
+    base_candidates = {"товар", "база", "код", "артикул"}
+    base_col = None
+    for c in df.columns:
+        if norm(c) in base_candidates:
+            base_col = c
+            break
+    if base_col is None:
+        base_col = df.columns[0]
 
-    # оставляем только первые два столбца
-    df = df.iloc[:, :2]
-    df.columns = ["Артикул", "Остаток"]      # как угодно, главное второй - количество
-    df["Остаток"] = df["Остаток"].astype(float)
+    # Колонки аналогов — те, где в названии есть "аналог"/"analog"
+    analog_cols = [c for c in df.columns if ("аналог" in norm(c) or "analog" in norm(c))]
+    if not analog_cols:
+        # Если специальных колонок нет — используем все, кроме base_col
+        analog_cols = [c for c in df.columns if c != base_col]
 
-    # заменяем запятую на точку в числах и убираем пустые строки
-    df.replace({",": "."}, regex=True, inplace=True)
-    df.dropna(how="all", inplace=True)
+    rules: dict[str, list[str]] = {}
+    for _, row in df.iterrows():
+        base = extract_base_code(row.get(base_col, ""))
+        if not base:
+            continue
+        lst: list[str] = []
+        for c in analog_cols:
+            cand = extract_base_code(row.get(c, ""))
+            if cand and cand != base and cand not in lst:
+                lst.append(cand)
+        if lst:
+            rules[base] = lst
+    return rules
 
-    return df
-# ─────────────────────────────────────────────────────
-
-
-
-# ─── StockManager.load (оставляем как есть) ───
-# в self.stock_column у вас уже будет строка "Остаток",
-# потому что read_table переименовал нужный столбец.
-
-
-
-# ---------- StockManager._detect_stock_column ----------
-def _detect_stock_column(self) -> str | None:
-    """Возвращает название колонки, содержащей остатки/кол-во."""
-    kw = {"остаток", "остатки", "колво", "количество", "qty"}
-
-    for col in self.df.columns:
-        name = _normalize(col)
-        if any(k in name for k in kw):
-            return col          # нашли подходящий столбец
-
-    return None                 # ничего не подошло
-
-
-# ---------- вспомогательная ----------
 def _norm_cell(text: str) -> str:
-    """
-    • приводит строку к NFC-форме (убирает скрытые акценты в кириллице)
-    • удаляет все символы категории «Zs» (прочие пробелы) и «Cc» (управляющие)
-    • убирает дефисы, подчёркивания, точки.
-    """
+    """Нормализуем строку: NFC, убираем пробелы/управляющие, дефисы/подчёркивания/точки."""
     text = unicodedata.normalize("NFC", text)
     text = "".join(ch for ch in text if unicodedata.category(ch) not in {"Zs", "Cc"})
-    text = re.sub(r"[-_.\s]", "", text)   # ещё раз на всякий
+    text = re.sub(r"[-_.\s]", "", text)
     return text.lower()
+
 # ───────────────────────── StockManager ──────────────────────────
 @dataclass
 class StockManager:
     df: pd.DataFrame = field(default_factory=pd.DataFrame)
     stock_column: str = "Остаток"
 
-    # ────────────────────────────────────────────────────────────
     def load(self, path: str) -> None:
+        """Загружает остатки (жёсткий формат: артикулы в A, количество в B, начиная с 10-й строки)."""
         raw = pd.read_excel(path, header=None)
         qty = raw.iloc[FIXED_STOCK_ROW:, FIXED_STOCK_COL]
         articles = raw.iloc[FIXED_STOCK_ROW:, 0]
@@ -183,29 +150,10 @@ class StockManager:
         self.df.reset_index(drop=True, inplace=True)
 
         self.df["Артикул"] = self.df["Артикул"].astype(str).str.strip()
-        self.df["Остаток"] = (
-            pd.to_numeric(self.df["Остаток"], errors="coerce").fillna(0.0)
-        )
-        self.df["BaseCode"] = self.df["Артикул"].apply(lambda s: extract_base_code(str(s)))
+        self.df["Остаток"] = pd.to_numeric(self.df["Остаток"], errors="coerce").fillna(0.0)
+        self.df["BaseCode"] = self.df["Артикул"].map(extract_base_code)
 
-        cat = _catalog.copy()
-        cat["code"] = cat["code"].astype(str).str.strip()
-
-        enrich = (
-            cat[["code", "family", "length_m", "color", "price_rub"]]
-            .rename(
-                columns={
-                    "code": "Артикул",
-                    "family": "Семейство_cat",
-                    "length_m": "Длина, м_cat",
-                    "color": "Цвет_cat",
-                    "price_rub": "price_rub_cat",
-                }
-            )
-        )
-
-        self.df = self.df.merge(enrich, on="Артикул", how="left", suffixes=("", "_cat"))
-
+        # Подтянем цены из каталога, если есть совпадение
         if isinstance(_catalog, pd.DataFrame) and {"code", "price_rub"} <= set(_catalog.columns):
             cat = _catalog.copy()
             cat["code"] = cat["code"].astype(str).str.strip()
@@ -213,16 +161,11 @@ class StockManager:
             enrich["price_rub"] = pd.to_numeric(enrich["price_rub"], errors="coerce")
             self.df = self.df.merge(enrich, on="Артикул", how="left")
 
-        for c in ["Семейство", "Длина, м", "Цвет", "price_rub"]:
-            if c not in self.df.columns:
-                self.df[c] = pd.NA
-
         self.stock_column = "Остаток"
         logger.info(f"Загружено {len(self.df)} строк остатков")
 
     def allocate(self, article: str, qty: float) -> Optional[pd.Series]:
-        """Reserve ``qty`` items of ``article`` if available."""
-
+        """Полное списание qty по конкретному артикулу, если хватает."""
         rows = self.df[self.df["Артикул"] == article]
         if not rows.empty:
             row = rows.iloc[0]
@@ -232,53 +175,25 @@ class StockManager:
         return None
 
     def allocate_partial(self, article: str, qty: float) -> float:
-        """Списывает доступное количество и возвращает остаток."""
+        """Списывает доступное количество по артикулу и возвращает остаток (сколько ещё нужно)."""
         rows = self.df[self.df["Артикул"] == article]
         if rows.empty:
             return qty
         row = rows.iloc[0]
-        avail = row[self.stock_column]
-        take = min(avail, qty)
+        avail = float(row[self.stock_column])
+        take = min(avail, float(qty))
         if take > 0:
-            self.df.at[row.name, self.stock_column] -= take
-        return qty - take
+            self.df.at[row.name, self.stock_column] = avail - take
+        return float(qty) - take
 
     def allocate_by_basecode(self, base_code: str, qty: float) -> list[tuple[pd.Series, float]]:
         """
-        Списывает qty по позициям склада, где BaseCode==base_code,
-        игнорируя цвет/длину. Идём по строкам с наибольшим остатком.
+        Списывает qty по позициям склада, где BaseCode == base_code (игнорируя цвет/длину).
         Возвращает список (row, taken); остаток в self.df уменьшается.
         """
-        allocs: list[tuple[pd.Series, float]] = []
-        rows = self.df[self.df["BaseCode"] == base_code]
-        rows = rows.sort_values(self.stock_column, ascending=False)
-        for _, r in rows.iterrows():
-            if qty <= 0:
-                break
-            avail = r[self.stock_column]
-            if avail <= 0:
-                continue
-            take = min(avail, qty)
-            if take > 0:
-                self.df.at[r.name, self.stock_column] -= take
-                qty -= take
-                allocs.append((r, take))
-        return allocs
-
-    def find_analog(
-        self,
-        family: str,
-        length: float,
-        color: str,
-        used: list[str],
-        target_price: float,
-    ) -> Optional[pd.Series]:
-        """Find analog item on stock matching family and length."""
-
-        df = self.df
-        if "BaseCode" not in df.columns:
+        if not base_code:
             return []
-        pool = df[(df["BaseCode"] == base_code) & (df[self.stock_column] > 0)].copy()
+        pool = self.df[(self.df["BaseCode"] == base_code) & (self.df[self.stock_column] > 0)].copy()
         if pool.empty:
             return []
         pool = pool.sort_values(self.stock_column, ascending=False)
@@ -295,7 +210,6 @@ class StockManager:
                 left -= take
         return out
 
-
 # ─────────────────────── InvoiceProcessor ────────────────────────
 @dataclass
 class InvoiceProcessor:
@@ -304,7 +218,6 @@ class InvoiceProcessor:
     df: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     original_sum: float = 0.0
-    used_analogs: List[str] = field(default_factory=list)
     result_rows: List[dict] = field(default_factory=list)
     log: List[str] = field(default_factory=list)
     invoice_path: Optional[str] = None
@@ -316,16 +229,7 @@ class InvoiceProcessor:
         hdr = _find_header_row(path)
         df = pd.read_excel(path, skiprows=hdr, header=0, dtype=str)
         self.invoice_path = path
-        self.output_columns = [
-            "Товар",
-            "Код",
-            "Количество",
-            "Ед.",
-            "Цена",
-            "в т.ч. НДС",
-            "Всего",
-            "Комментарий",
-        ]
+        self.output_columns = ["Товар", "Код", "Количество", "Ед.", "Цена", "в т.ч. НДС", "Всего", "Комментарий"]
 
         rename_map: dict[str, str] = {}
         for col in df.columns:
@@ -338,7 +242,6 @@ class InvoiceProcessor:
                 rename_map[col] = "Цена"
 
         df.rename(columns=rename_map, inplace=True)
-
         if "Цена" not in df.columns:
             df["Цена"] = pd.NA
 
@@ -350,23 +253,10 @@ class InvoiceProcessor:
         df["Цена"] = pd.to_numeric(df.get("Цена"), errors="coerce")
         df.dropna(subset=["Количество"], inplace=True)
 
-        # запоминаем реальные названия колонок кода/кол-ва/цены
-        self.col_code = next(
-            (c for c in df.columns if _normalize(c).startswith(("код", "артикул"))),
-            "Артикул",
-        )
-        self.col_qty = next(
-            (c for c in df.columns if _normalize(c).startswith("кол")),
-            "Количество",
-        )
-        self.col_price = next(
-            (
-                c
-                for c in df.columns
-                if _normalize(c).startswith(("цена", "стоимость", "price"))
-            ),
-            "Цена",
-        )
+        # запоминаем реальные названия колонок
+        self.col_code = next((c for c in df.columns if _normalize(c).startswith(("код", "артикул"))), "Артикул")
+        self.col_qty = next((c for c in df.columns if _normalize(c).startswith("кол")), "Количество")
+        self.col_price = next((c for c in df.columns if _normalize(c).startswith(("цена", "стоимость", "price"))), "Цена")
 
         self.df = df
 
@@ -375,25 +265,19 @@ class InvoiceProcessor:
             logger.warning(f"Дубликаты в счёте: {dups['Артикул'].tolist()}")
 
         if self.df["Цена"].notna().any():
-            self.original_sum = (
-                self.df["Количество"] * self.df["Цена"]
-            ).sum()
-            logger.info(
-                f"Загружен счёт на {self.original_sum:,.2f} ₽"
-            )
+            self.original_sum = (self.df["Количество"] * self.df["Цена"]).sum()
+            logger.info(f"Загружен счёт на {self.original_sum:,.2f} ₽")
         else:
             self.original_sum = 0.0
             logger.info("Загружен счёт без цен")
 
     # ── основная логика ───────────────────────────────────────────
     def process(self) -> None:
-        """Process invoice rows using available stock and catalog."""
-
-        self.used_analogs.clear()
+        """Подбирает аналоги строго по таблице правил (без семьи/цвета/длины)."""
         self.result_rows.clear()
         self.log.clear()
 
-        # --- VALIDATE INPUT -------------------------------------------------
+        # валидация
         required_cols = {"Артикул", "Количество"}
         missing = required_cols - set(self.df.columns)
         if missing:
@@ -401,102 +285,66 @@ class InvoiceProcessor:
             self.log.append(msg)
             logger.error(msg)
             return
-        # --------------------------------------------------------------------
+
+        rules = self.app.rules if self.app and getattr(self.app, "rules", None) else {}
 
         for _, row in self.df.iterrows():
             art = row[self.col_code]
-            need = row[self.col_qty]
+            need = float(row[self.col_qty])
             price = row.get(self.col_price, pd.NA)
 
-            # характеристики из Flexy-каталога
-            cat_row = _catalog[_catalog["code"] == art]
-            if not cat_row.empty:
-                cat_row = cat_row.iloc[0]
-                if pd.isna(price):
-                    price = cat_row["price_rub"]
+            # если в счёте не было цены — попробуем из каталога
+            if pd.isna(price):
+                cat_row = _catalog[_catalog["code"] == art]
+                if not cat_row.empty:
+                    price = pd.to_numeric(cat_row.iloc[0].get("price_rub"), errors="coerce")
 
+            # списываем, что есть по точному артикулу
             left = self.stock.allocate_partial(art, need)
             shipped = need - left
 
-            # ----- строка с фактически списанным количеством -----
-            if shipped:
-                base = {c: "" for c in self.output_columns}
+            # фиксируем отгруженное по исходной позиции
+            if shipped > 0:
+                base_out = {c: "" for c in self.output_columns}
                 for c in self.output_columns:
                     if c == self.col_code:
-                        base[c] = art
+                        base_out[c] = art
                     elif c == self.col_qty:
-                        base[c] = shipped
+                        base_out[c] = shipped
                     elif c == self.col_price and pd.notna(price):
-                        base[c] = price
+                        base_out[c] = float(price)
                     else:
-                        base[c] = row.get(c, "")
-                self.result_rows.append(base)
+                        base_out[c] = row.get(c, "")
+                self.result_rows.append(base_out)
 
-            # ----- если нужен аналог -----
-            if left:
+            # нужно закрыть остаток через аналоги по правилам
+            if left > 0:
                 base_code = extract_base_code(art)
-                candidates = (
-                    self.app.rules.get(base_code, []) if self.app else []
-                )
-                if candidates:
-                    for cand_base in candidates:
-                        allocs = self.stock.allocate_by_basecode(cand_base, left)
+                cand_bases = rules.get(base_code, [])
+                if cand_bases:
+                    for b in cand_bases:
+                        if left <= 0:
+                            break
+                        allocs = self.stock.allocate_by_basecode(b, left)
                         for r, taken in allocs:
                             add = {c: "" for c in self.output_columns}
                             add[self.col_code] = r["Артикул"]
                             add[self.col_qty] = taken
-                            price_val = r.get("price_rub", price)
-                            if pd.notna(price_val):
-                                add[self.col_price] = price_val
+                            pr = pd.to_numeric(r.get("price_rub"), errors="coerce")
+                            if pd.notna(pr):
+                                add[self.col_price] = float(pr)
+                            elif pd.notna(price):
+                                add[self.col_price] = float(price)
                             for c in self.output_columns:
                                 if add[c] == "" and c in row:
                                     add[c] = row[c]
                             self.result_rows.append(add)
-                            self.log.append(
-                                f"{art}: {taken} шт → {r['Артикул']} (по правилам)"
-                            )
-                            self.used_analogs.append(r["Артикул"])
+                            self.log.append(f"{art}: {taken} шт → {r['Артикул']} (по правилам)")
                             left -= taken
-                        if left <= 0:
-                            break
                     if left > 0:
-                        self.log.append(f"{art}: аналогов нет по правилам")
-                    continue
-
-                analog = self.stock.find_analog(
-                    family=family,
-                    length=length,
-                    color=color,
-                    used=self.used_analogs,
-                    target_price=price,
-                )
-                for b in cand_bases:
-                    if left <= 0:
-                        break
-                    allocs = self.stock.allocate_by_basecode(b, left)
-                    for r, taken in allocs:
-                        add = {c: "" for c in self.output_columns}
-                        add[self.col_code] = r["Артикул"]
-                        add[self.col_qty] = taken
-                        price_src = r.get("price_rub")
-                        if pd.notna(price_src):
-                            add[self.col_price] = float(price_src)
-                        elif pd.notna(price):
-                            add[self.col_price] = float(price)
-                        for c in self.output_columns:
-                            if add[c] == "" and c in row:
-                                add[c] = row[c]
-                        self.result_rows.append(add)
-                        left -= taken
-                        self.log.append(
-                            f"{art}: {taken} шт → {r['Артикул']} (по правилам)"
-                        )
-                if left > 0 and not cand_bases:
+                        self.log.append(f"{art}: не хватило {left} шт — аналоги по правилам закончились")
+                else:
                     self.log.append(f"{art}: аналогов нет по правилам")
-                elif left > 0 and cand_bases:
-                    self.log.append(
-                        f"{art}: не хватило {left} шт — аналоги по правилам закончились"
-                    )
 
         if not self.result_rows:
             msg = "аналогов не найдено, счёт не изменён"
@@ -506,9 +354,7 @@ class InvoiceProcessor:
     # ── вывод ─────────────────────────────────────────────────────
     def to_dataframe(self) -> pd.DataFrame:
         if not self.result_rows:
-            cols = ["Артикул", "Количество", "Цена", "Комментарий"]
-            return pd.DataFrame(columns=cols)
-
+            return pd.DataFrame(columns=["Артикул", "Количество", "Цена", "Комментарий"])
         df = pd.DataFrame(self.result_rows)
         for col in ["Количество", "Цена"]:
             if col in df.columns:
@@ -516,33 +362,20 @@ class InvoiceProcessor:
         return df
 
     def save(self, path: str) -> None:
-        """Save processed invoice to ``path``.
-
-        Новый файл создаётся всегда. Колонка «Комментарий» добавляется,
-        если её не было в исходном счёте.
-        """
-
+        """Сохраняет новый счёт в ``path``; колонка «Комментарий» гарантируется."""
         base = pd.read_excel(
             self.invoice_path,
             skiprows=_find_header_row(self.invoice_path),
             header=0,
             dtype=str,
         )
-
         if "Комментарий" not in base.columns:
             base["Комментарий"] = ""
-
-        add = [
-            {c: r.get(c, "") for c in base.columns}
-            for r in self.result_rows[len(self.df):]
-        ]
+        add = [{c: r.get(c, "") for c in base.columns} for r in self.result_rows[len(self.df):]]
         if add:
             base = pd.concat([base, pd.DataFrame(add)], ignore_index=True)
-
         base.to_excel(path, index=False)
         logger.info(f"Счёт сохранён в {path}")
-
-
 
 # ───────────────────────────── GUI ───────────────────────────────
 class App:
@@ -566,10 +399,13 @@ class App:
         self.stock = StockManager()
         self.rules: dict[str, list[str]] = {}
         try:
-            self.rules = load_analog_rules(RULES_DEFAULT_PATH)
-            logger.info(f"Правила загружены: {len(self.rules)} баз")
-        except FileNotFoundError:
-            logger.info("Правила не найдены")
+            if os.path.exists(RULES_DEFAULT_PATH):
+                self.rules = load_analog_rules(RULES_DEFAULT_PATH)
+                logger.info(f"Правила загружены: {len(self.rules)} баз (авто)")
+            else:
+                logger.info("Правила не найдены")
+        except Exception:
+            logger.exception("Автозагрузка правил не удалась")
 
         self.processor = InvoiceProcessor(stock=self.stock, app=self)
         self.stock_file: Optional[str] = None
@@ -632,10 +468,10 @@ class App:
             return
         try:
             self.rules = load_analog_rules(path)
+            self.processor.app = self
             self.gui_log(f"Правила загружены: {len(self.rules)} баз")
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Ошибка", str(exc))
-        self.processor.app = self
 
     def build_invoice(self) -> None:
         if self.stock.df.empty or self.processor.df.empty:
@@ -650,10 +486,8 @@ class App:
         self.gui_log("\n".join(self.processor.log))
         messagebox.showinfo("Готово", f"Новый счёт сохранён: {out_path}")
 
-    # ── run ──────────────────────────────────────────────────────
     def run(self) -> None:
         self.root.mainloop()
-
 
 # ────────────────────────── entry point ──────────────────────────
 if __name__ == "__main__":
