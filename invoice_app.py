@@ -8,6 +8,29 @@ Invoice Builder GUI
 # ──────────────────────────── imports ────────────────────────────
 from __future__ import annotations
 
+import sys, logging
+from logging.handlers import RotatingFileHandler
+logger = logging.getLogger("invoice")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    _fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(name)s: %(message)s")
+    _fh = RotatingFileHandler("app.log", maxBytes=1_048_576, backupCount=5, encoding="utf-8")
+    _fh.setFormatter(_fmt)
+    logger.addHandler(_fh)
+    logger.propagate = False
+
+def _attach_cli_stream_logger():
+    """Attach stdout stream handler once (for --cli / --show-log)."""
+    import logging, sys
+    _fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(name)s: %(message)s")
+    for h in logger.handlers:
+        if isinstance(h, logging.StreamHandler) and getattr(h, "_cli", False):
+            return
+    sh = logging.StreamHandler(sys.stdout)
+    sh._cli = True  # mark
+    sh.setFormatter(_fmt)
+    logger.addHandler(sh)
+
 import os
 import sys
 import shutil
@@ -132,7 +155,6 @@ def _norm_cell(text: str) -> str:
     text = "".join(ch for ch in text if unicodedata.category(ch) not in {"Zs", "Cc"})
     text = re.sub(r"[-_.\s]", "", text)
     return text.lower()
-
 # ───────────────────────── StockManager ──────────────────────────
 @dataclass
 class StockManager:
@@ -221,13 +243,19 @@ class InvoiceProcessor:
     result_rows: List[dict] = field(default_factory=list)
     log: List[str] = field(default_factory=list)
     invoice_path: Optional[str] = None
-    output_columns: List[str] = field(default_factory=list)
+    base_columns: List[str] = field(default_factory=list)
+    disp_code: str = ""
+    disp_qty: str = ""
+    disp_price: str = ""
+    col_code: str = "Артикул"
+    col_qty: str = "Количество"
+    col_price: str = "Цена"
 
     # ── загрузка счёта ────────────────────────────────────────────
     def load(self, path: str) -> None:
         """Загружает счёт, автоматически определяя строку заголовка."""
         hdr = _find_header_row(path)
-        df = pd.read_excel(path, skiprows=hdr, header=0, dtype=str)
+        base = pd.read_excel(path, skiprows=hdr, header=0, dtype=str)
         self.invoice_path = path
         self.output_columns = ["Товар", "Код", "Количество", "Ед.", "Цена", "в т.ч. НДС", "Всего", "Комментарий"]
 
@@ -259,8 +287,7 @@ class InvoiceProcessor:
         self.col_price = next((c for c in df.columns if _normalize(c).startswith(("цена", "стоимость", "price"))), "Цена")
 
         self.df = df
-
-        dups = self.df[self.df.duplicated("Артикул")]
+        dups = self.df[self.df.duplicated(self.col_code)]
         if not dups.empty:
             logger.warning(f"Дубликаты в счёте: {dups['Артикул'].tolist()}")
 
@@ -356,10 +383,7 @@ class InvoiceProcessor:
         if not self.result_rows:
             return pd.DataFrame(columns=["Артикул", "Количество", "Цена", "Комментарий"])
         df = pd.DataFrame(self.result_rows)
-        for col in ["Количество", "Цена"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
-        return df
+        return df.reindex(columns=cols)
 
     def save(self, path: str) -> None:
         """Сохраняет новый счёт в ``path``; колонка «Комментарий» гарантируется."""
