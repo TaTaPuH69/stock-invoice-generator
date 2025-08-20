@@ -166,20 +166,6 @@ def _norm_cell(text: str) -> str:
     text = "".join(ch for ch in text if unicodedata.category(ch) not in {"Zs", "Cc"})
     text = re.sub(r"[-_.\s]", "", text)   # ещё раз на всякий
     return text.lower()
-
-
-
-def find_analog(code: str, length: float) -> Optional[str]:
-    fam = _catalog.loc[_catalog["code"] == code, "family"]
-    if fam.empty:
-        return None
-    fam = fam.iat[0]
-    subset = _catalog.query("family == @fam and length_m == @length")
-    if subset.empty:
-        return None
-    return subset.sort_values("price_rub").iloc[0]["code"]
-
-
 # ───────────────────────── StockManager ──────────────────────────
 @dataclass
 class StockManager:
@@ -290,24 +276,24 @@ class StockManager:
         """Find analog item on stock matching family and length."""
 
         df = self.df
-        cand = df[
-            (df["Семейство"] == family)
-            & (~df["Артикул"].isin(used))
-            & (df["Длина, м"].astype(float).sub(length).abs() <= 0.2)
-        ]
-
-        if _is_filled(color) and "Цвет" in cand.columns:
-            same_color = cand[cand["Цвет"] == color]
-            if not same_color.empty:
-                cand = same_color
-
-        if cand.empty:
-            return None
-
-        cand = cand.copy()
-        cand["price_diff"] = (cand["price_rub"] - target_price).abs()
-        cand = cand.sort_values(["price_diff", self.stock_column], ascending=[True, False])
-        return cand.iloc[0]
+        if "BaseCode" not in df.columns:
+            return []
+        pool = df[(df["BaseCode"] == base_code) & (df[self.stock_column] > 0)].copy()
+        if pool.empty:
+            return []
+        pool = pool.sort_values(self.stock_column, ascending=False)
+        left = float(qty)
+        out: list[tuple[pd.Series, float]] = []
+        for idx, row in pool.iterrows():
+            if left <= 0:
+                break
+            avail = float(row[self.stock_column])
+            take = min(avail, left)
+            if take > 0:
+                self.df.at[idx, self.stock_column] = avail - take
+                out.append((row, take))
+                left -= take
+        return out
 
 
 # ─────────────────────── InvoiceProcessor ────────────────────────
@@ -512,10 +498,6 @@ class InvoiceProcessor:
                         f"{art}: не хватило {left} шт — аналоги по правилам закончились"
                     )
 
-        if not self.result_rows:
-            msg = "аналогов не найдено, счёт не изменён"
-            self.log.append(msg)
-            logger.info(msg)
         if not self.result_rows:
             msg = "аналогов не найдено, счёт не изменён"
             self.log.append(msg)
