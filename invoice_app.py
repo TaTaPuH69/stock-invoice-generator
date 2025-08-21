@@ -5,7 +5,7 @@ from __future__ import annotations
 import os, sys, re, logging, shutil, unicodedata, argparse
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -35,7 +35,16 @@ FIXED_STOCK_COL = 1
 AMOUNT_ABS_TOL = 0.0     # абсолютная толерантность по сумме, ₽
 AMOUNT_REL_TOL = 0.00    # относительная, доля (0.05 = 5%)
 
+# подбор аналогов по стоимости допускает отклонение 3%
+VALUE_TOL = 0.03
+
 _catalog = load_catalog()
+
+
+@dataclass
+class AnalogCandidate:
+    base: str
+    price: Optional[float] = None
 
 # ── helpers ──────────────────────────────────────────────────────
 def _normalize(col: str) -> str:
@@ -68,7 +77,7 @@ def swap_base_in_code(code_str: str, new_base: str) -> str:
     s, e = m.span(1)
     return code_str[:s] + str(new_base) + code_str[e:]
 
-def load_analog_rules(path: str = RULES_DEFAULT_PATH) -> dict[str, list[str]]:
+def load_analog_rules(path: str = RULES_DEFAULT_PATH) -> Dict[str, List[AnalogCandidate]]:
     if not os.path.exists(path):
         return {}
     df = pd.read_excel(path, dtype=str).fillna("")
@@ -77,26 +86,43 @@ def load_analog_rules(path: str = RULES_DEFAULT_PATH) -> dict[str, list[str]]:
         return str(x).strip().lower().replace(" ", "")
 
     base_candidates = {"товар", "база", "код", "артикул"}
-    base_col = next((c for c in df.columns if norm(c) in base_candidates), None)
-    if base_col is None:
-        base_col = df.columns[0]
+    base_col = next((c for c in df.columns if norm(c) in base_candidates), df.columns[0])
 
     analog_cols = [c for c in df.columns if ("аналог" in norm(c) or "analog" in norm(c))]
-    if not analog_cols:
-        analog_cols = [c for c in df.columns if c != base_col]
+    price_cols = [c for c in df.columns if ("цена" in norm(c) or "price" in norm(c))]
 
-    rules: dict[str, list[str]] = {}
+    if not analog_cols:
+        analog_cols = [c for c in df.columns if c not in {base_col} | set(price_cols)]
+
+    def suffix(name: str) -> str:
+        m = re.search(r"(\d+)$", norm(name))
+        return m.group(1) if m else ""
+
+    price_by_suffix = {suffix(c): c for c in price_cols if suffix(c)}
+    default_price_col = next((c for c in price_cols if suffix(c) == ""), None)
+
+    rules: Dict[str, List[AnalogCandidate]] = {}
     for _, row in df.iterrows():
         base = extract_base_code(row.get(base_col, ""))
         if not base:
             continue
-        lst: list[str] = []
+        candidates: List[AnalogCandidate] = []
         for c in analog_cols:
-            cand = extract_base_code(row.get(c, ""))
-            if cand and cand != base and cand not in lst:
-                lst.append(cand)
-        if lst:
-            rules[base] = lst
+            cand_base = extract_base_code(row.get(c, ""))
+            if not cand_base or cand_base == base:
+                continue
+            suf = suffix(c)
+            price_val = None
+            price_col = price_by_suffix.get(suf)
+            if price_col:
+                price_val = pd.to_numeric(row.get(price_col, ""), errors="coerce")
+            elif default_price_col:
+                price_val = pd.to_numeric(row.get(default_price_col, ""), errors="coerce")
+            price_val = float(price_val) if pd.notna(price_val) else None
+            if cand_base not in {cand.base for cand in candidates}:
+                candidates.append(AnalogCandidate(base=cand_base, price=price_val))
+        if candidates:
+            rules[base] = candidates
     return rules
 
 def _is_filled(val) -> bool:
@@ -150,29 +176,11 @@ class StockManager:
             return None
         return float(pr.mean())
 
-    def allocate_exact(self, article: str, qty: float) -> bool:
-        """Резервирует qty по точному артикулу, если хватает. Возвращает True/False."""
-        if self.total_for_article(article) < qty:
-            return False
-        left = qty
-        idxs = self.df.index[self.df["Артикул"] == article]
-        for idx in idxs:
-            if left <= 0:
-                break
-            avail = float(self.df.at[idx, self.stock_column])
-            take = min(avail, left)
-            if take > 0:
-                self.df.at[idx, self.stock_column] = avail - take
-                left -= take
-        return True
-
-    def allocate_by_basecode(self, base_code: str, qty: float) -> bool:
-        """Резервирует qty суммарно по позиции с нужной базой. Возвращает True/False."""
-        if self.total_for_base(base_code) < qty or qty <= 0:
-            return False
-        left = qty
-        pool = self.df[(self.df["BaseCode"] == base_code) & (self.df[self.stock_column] > 0)].copy()
-        pool = pool.sort_values(self.stock_column, ascending=False)
+    def allocate_partial(self, article: str, qty: float) -> float:
+        """Снимает со склада до qty метров по точному артикулу и возвращает отпущенное количество."""
+        pool = self.df[(self.df["Артикул"] == article) & (self.df[self.stock_column] > 0)]
+        left = float(qty)
+        shipped = 0.0
         for idx, r in pool.iterrows():
             if left <= 0:
                 break
@@ -181,7 +189,55 @@ class StockManager:
             if take > 0:
                 self.df.at[idx, self.stock_column] = avail - take
                 left -= take
-        return left <= 1e-9
+                shipped += take
+        return shipped
+
+    def allocate_value_by_base(
+        self,
+        base_code: str,
+        target_value: float,
+        price_override: Optional[float],
+        tol_value: float,
+    ) -> Tuple[List[Tuple[pd.Series, float]], float]:
+        pool = self.df[(self.df["BaseCode"] == base_code) & (self.df[self.stock_column] > 0)].copy()
+        if pool.empty or target_value <= tol_value:
+            return [], target_value
+
+        if price_override is not None:
+            pool["unit_price"] = float(price_override)
+        else:
+            pool["unit_price"] = pd.to_numeric(pool.get("price_rub"), errors="coerce")
+
+        missing = pool[pool["unit_price"].isna()]
+        for _, r in missing.iterrows():
+            logger.warning(f"{r['Артикул']}: отсутствует цена; строка пропущена")
+        pool.dropna(subset=["unit_price"], inplace=True)
+        pool = pool[pool["unit_price"] > 0]
+        if pool.empty:
+            return [], target_value
+
+        if price_override is not None:
+            pool = pool.sort_values(self.stock_column, ascending=False)
+        else:
+            pool = pool.sort_values(["unit_price", self.stock_column], ascending=[True, False])
+
+        remaining = float(target_value)
+        allocations: List[Tuple[pd.Series, float]] = []
+        for idx, r in pool.iterrows():
+            if remaining <= tol_value:
+                break
+            avail = float(r[self.stock_column])
+            unit_price = float(r["unit_price"])
+            qty = min(avail, remaining / unit_price)
+            qty = round(qty, 2)
+            if qty <= 0:
+                continue
+            self.df.at[idx, self.stock_column] = avail - qty
+            row_data = self.df.loc[idx].copy()
+            allocations.append((row_data, qty))
+            remaining -= qty * unit_price
+
+        return allocations, remaining
 
     def display_name_for_base(self, base_code: str) -> str:
         rows = self.df[self.df["BaseCode"] == base_code]
@@ -195,24 +251,35 @@ class InvoiceProcessor:
     stock: StockManager
     app: Optional["App"] = None
     df: pd.DataFrame = field(default_factory=pd.DataFrame)
+    raw_df: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     original_sum: float = 0.0
     result_rows: List[dict] = field(default_factory=list)
     log: List[str] = field(default_factory=list)
     invoice_path: Optional[str] = None
     header_row_idx: int = 0
-    headers: List[str] = field(default_factory=list)
+    output_columns: List[str] = field(default_factory=list)
 
     col_code: str = "Артикул"
     col_qty: str = "Количество"
     col_price: str = "Цена"
+    col_code_orig: Optional[str] = None
+    col_qty_orig: Optional[str] = None
+    col_price_orig: Optional[str] = None
+    col_name_orig: Optional[str] = None
 
     def load(self, path: str) -> None:
         hdr = _find_header_row(path)
-        df = pd.read_excel(path, skiprows=hdr, header=0, dtype=str)
+        base = pd.read_excel(path, skiprows=hdr, header=0, dtype=str)
         self.invoice_path = path
         self.header_row_idx = hdr
 
+        self.raw_df = base.copy()
+        self.output_columns = list(base.columns)
+        if "Комментарий" not in self.output_columns:
+            self.output_columns.append("Комментарий")
+
+        df = base.copy()
         rename_map: dict[str, str] = {}
         for col in df.columns:
             norm = _normalize(col)
@@ -236,14 +303,30 @@ class InvoiceProcessor:
         df["Цена"] = pd.to_numeric(df.get("Цена"), errors="coerce")
         df.dropna(subset=["Количество"], inplace=True)
 
+        self.raw_df = self.raw_df.loc[df.index].copy()
+        df.reset_index(drop=True, inplace=True)
+        self.raw_df.reset_index(drop=True, inplace=True)
+
         self.col_code = "Артикул"
         self.col_qty = "Количество"
         self.col_price = "Цена"
 
+        inv_map = {v: k for k, v in rename_map.items()}
+        self.col_code_orig = inv_map.get("Артикул")
+        self.col_qty_orig = inv_map.get("Количество")
+        self.col_price_orig = inv_map.get("Цена")
+        self.col_name_orig = inv_map.get("Товар")
+
+        if self.col_code_orig is None and "Артикул" in self.output_columns:
+            self.col_code_orig = "Артикул"
+        if self.col_qty_orig is None and "Количество" in self.output_columns:
+            self.col_qty_orig = "Количество"
+        if self.col_price_orig is None and "Цена" in self.output_columns:
+            self.col_price_orig = "Цена"
+        if self.col_name_orig is None and "Товар" in self.output_columns:
+            self.col_name_orig = "Товар"
+
         self.df = df
-        self.headers = list(df.columns)
-        if "Комментарий" not in self.headers:
-            self.headers.append("Комментарий")
 
         if self.df["Цена"].notna().any():
             self.original_sum = (self.df["Количество"] * self.df["Цена"]).sum()
@@ -253,112 +336,82 @@ class InvoiceProcessor:
             logger.info("Загружен счёт без цен")
 
     def process(self) -> None:
-        """При замене подбираем КОЛИЧЕСТВО аналога так, чтобы сумма была максимально близкой к исходной."""
         self.result_rows.clear()
         self.log.clear()
 
         rules = self.app.rules if self.app and getattr(self.app, "rules", None) else {}
 
-        for _, row in self.df.iterrows():
-            art = row.get(self.col_code, "")
+        for (idx, row), (_, orig_row) in zip(self.df.iterrows(), self.raw_df.iterrows()):
+            art = str(row.get(self.col_code, "")).strip()
+            if not art:
+                continue
             need = float(row.get(self.col_qty, 0) or 0)
-            price = row.get(self.col_price, pd.NA)  # цена исходного
-            item_name = row.get("Товар", "")
 
-            # если нет цены — попробуем из каталога
+            price = row.get(self.col_price, pd.NA)
             if pd.isna(price):
                 cat_row = _catalog[_catalog["code"] == art]
                 if not cat_row.empty:
                     price = pd.to_numeric(cat_row.iloc[0].get("price_rub"), errors="coerce")
+            orig_price = float(price) if pd.notna(price) else 0.0
 
-            # если и сейчас цены нет — не сможем подгонять по сумме, оставим попытку «как есть»
-            target_amount = None if pd.isna(price) else float(price) * need
+            target_sum = need * orig_price
+            tol_value = max(10.0, VALUE_TOL * target_sum)
 
-            # 1) пробуем исходный товар целиком
-            if self.stock.allocate_exact(art, need):
-                rec = {c: row.get(c, "") for c in self.headers}
-                rec["Артикул"] = art
-                rec["Количество"] = need
-                if pd.notna(price):
-                    rec["Цена"] = float(price)
+            shipped = self.stock.allocate_partial(art, need)
+            shipped_sum = shipped * orig_price
+            self.log.append(
+                f"{art}: отгружено {shipped:.2f} м исходного кода по {orig_price:.2f} → {shipped_sum:.2f} ₽"
+            )
+            if shipped > 0:
+                rec = {c: orig_row.get(c, "") for c in self.output_columns}
+                if self.col_code_orig:
+                    rec[self.col_code_orig] = art
+                if self.col_qty_orig:
+                    rec[self.col_qty_orig] = shipped
+                if self.col_price_orig:
+                    rec[self.col_price_orig] = orig_price
                 self.result_rows.append(rec)
+
+            value_left = max(target_sum - shipped_sum, 0.0)
+            if value_left <= tol_value:
                 continue
 
-            # 2) выбираем ОДИН лучший аналог ─ тот, где возможная сумма ближе к целевой
+            self.log.append(f"{art}: добираем {value_left:.2f} ₽ аналогами")
             base_code = extract_base_code(art)
-            cand_bases = rules.get(base_code, [])
-
-            best = None  # (diff, base_cand, qty_use, pr_unit)
-            for base_cand in cand_bases:
-                avail_total = int(self.stock.total_for_base(base_cand))
-                if avail_total <= 0:
-                    continue
-
-                pr_unit = self.stock.avg_price_for_base(base_cand)
-                if pr_unit is None or pr_unit <= 0:
-                    # fallback: если не знаем цену аналога, смысла подгонять нет
-                    pr_unit = float(price) if not pd.isna(price) else None
-                if pr_unit is None or pr_unit <= 0:
-                    continue
-
-                if target_amount is None:
-                    # нет целевой суммы — будем стремиться оставить исходное количество,
-                    # но не больше доступного
-                    qty_target = min(avail_total, int(round(need)))
-                else:
-                    qty_target = int(round(target_amount / pr_unit))
-                    qty_target = max(1, qty_target)
-                    qty_target = min(avail_total, qty_target)
-
-                # пересчёт суммы и отклонения
-                total_here = qty_target * pr_unit
-                diff = abs((target_amount or (need * pr_unit)) - total_here)
-
-                # если равные diff — отдаём приоритет более раннему в списке правил
-                if (best is None) or (diff < best[0]):
-                    best = (diff, base_cand, qty_target, pr_unit)
-
-            if best is not None:
-                _, base_cand, qty_use, pr_unit = best
-
-                # финальная попытка аллокации (на момент выбора склад мог измениться)
-                avail_now = int(self.stock.total_for_base(base_cand))
-                qty_use = max(1, min(avail_now, int(qty_use)))
-                if qty_use > 0 and self.stock.allocate_by_basecode(base_cand, qty_use):
-                    new_code = swap_base_in_code(art, base_cand)
-                    new_item = self.stock.display_name_for_base(base_cand)
-
-                    rec = {c: row.get(c, "") for c in self.headers}
-                    rec["Артикул"] = new_code                # колонка «Код»
-                    rec["Товар"]   = new_item                # колонка «Товар»
-                    rec["Количество"] = float(qty_use)       # подобранное кол-во
-                    rec["Цена"] = float(pr_unit)             # цена аналога за единицу
-
-                    # лог — показываем расхождение по сумме
-                    target = target_amount if target_amount is not None else need * pr_unit
-                    actual = qty_use * pr_unit
-                    delta = actual - target
-                    self.log.append(
-                        f"{art} → {new_code}: цена {pr_unit:.2f}, кол-во {qty_use} "
-                        f"(цель {target:.2f}, факт {actual:.2f}, Δ {delta:+.2f})"
-                    )
-
+            candidates = rules.get(base_code, [])
+            for cand in candidates:
+                allocs, value_left = self.stock.allocate_value_by_base(
+                    cand.base, value_left, cand.price, tol_value
+                )
+                for stock_row, qty in allocs:
+                    analog_code = str(stock_row.get("Артикул"))
+                    unit_price = cand.price if cand.price is not None else float(stock_row.get("price_rub", 0) or 0)
+                    analog_sum = qty * unit_price
+                    rec = {c: orig_row.get(c, "") for c in self.output_columns}
+                    if self.col_code_orig:
+                        rec[self.col_code_orig] = analog_code
+                    if self.col_name_orig:
+                        rec[self.col_name_orig] = analog_code
+                    if self.col_qty_orig:
+                        rec[self.col_qty_orig] = qty
+                    if self.col_price_orig:
+                        rec[self.col_price_orig] = unit_price
                     self.result_rows.append(rec)
-                    continue
+                    self.log.append(
+                        f"{art}: {qty:.2f} м → {analog_code} по {unit_price:.2f} ({analog_sum:.2f} ₽)"
+                    )
+                if value_left <= tol_value:
+                    break
 
-            # если сюда дошли — аналог не найден/не подобрался
-            self.log.append(f"{art}: аналог не подобран — строка без изменений")
-            rec = {c: row.get(c, "") for c in self.headers}
-            self.result_rows.append(rec)
+            if value_left > tol_value:
+                self.log.append(
+                    f"{art}: не хватило {value_left:.2f} ₽ — аналоги закончились"
+                )
 
     def to_dataframe(self) -> pd.DataFrame:
         if not self.result_rows:
-            return pd.DataFrame(columns=self.headers)
-        df = pd.DataFrame(self.result_rows)
-        keep = [c for c in self.headers if c in df.columns]
-        if "Комментарий" in df.columns and "Комментарий" not in keep:
-            keep.append("Комментарий")
-        return df[keep]
+            return pd.DataFrame(columns=self.output_columns)
+        return pd.DataFrame(self.result_rows, columns=self.output_columns)
 
     def save(self, path: str) -> None:
         """Перезаписываем ТОЛЬКО табличную часть исходного файла, сохраняя шапку/визуал."""
@@ -397,26 +450,23 @@ class InvoiceProcessor:
         # записать новые строки
         r = start
         for rec in rows:
-            values = [None] * len(headers)
+            values = [rec.get(h, "") for h in headers]
 
-            if idx_item  is not None: values[idx_item]  = rec.get("Товар", rec.get("Наименование", ""))
-            if idx_code  is not None: values[idx_code]  = rec.get("Артикул", rec.get("Код", ""))
-            if idx_qty   is not None: values[idx_qty]   = rec.get("Количество", "")
-            if idx_price is not None: values[idx_price] = rec.get("Цена", "")
-
-            if idx_comm is not None:
-                values[idx_comm] = rec.get("Комментарий", "")
-
-            # Всего / НДС
+            q = 0.0
+            p = 0.0
             try:
-                q = float(rec.get("Количество", 0) or 0)
-                p = float(rec.get("Цена", 0) or 0)
+                if self.col_qty_orig:
+                    q = float(rec.get(self.col_qty_orig, 0) or 0)
+                if self.col_price_orig:
+                    p = float(rec.get(self.col_price_orig, 0) or 0)
             except Exception:
                 q = p = 0.0
             if idx_total is not None:
                 values[idx_total] = round(q * p, 2)
             if idx_vat is not None:
                 values[idx_vat] = round(q * p * VAT_RATE, 2)
+            if idx_comm is not None and idx_comm < len(values):
+                values[idx_comm] = rec.get("Комментарий", "")
 
             for c, val in enumerate(values, start=1):
                 ws.cell(row=r, column=c, value=val)
@@ -450,7 +500,7 @@ class App:
         Button(self.root, text="Скачать логи", command=self.save_logs).pack()
 
         self.stock = StockManager()
-        self.rules: dict[str, list[str]] = {}
+        self.rules: Dict[str, List[AnalogCandidate]] = {}
         try:
             if os.path.exists(RULES_DEFAULT_PATH):
                 self.rules = load_analog_rules(RULES_DEFAULT_PATH)
