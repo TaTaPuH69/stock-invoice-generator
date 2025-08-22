@@ -1,636 +1,540 @@
-#!/usr/bin/env python
 # coding: utf-8
+"""Stock invoice generator with GUI and CLI.
+Single file implementation following specification.
+"""
 from __future__ import annotations
 
-import os, sys, re, logging, shutil, unicodedata, argparse
-from logging.handlers import RotatingFileHandler
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Tuple
+import os
+import sys
+import re
+import argparse
+import logging
+import unicodedata
+import fnmatch
+import io
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
-from openpyxl import load_workbook
+from pandas import DataFrame
+from openpyxl import Workbook  # ensure openpyxl available
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext
 
-from flexy_catalog_loader import load_catalog
+import flexy_catalog_loader
 
-# ── logging ──────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
+# logging setup
+log_stream = io.StringIO()
 logger = logging.getLogger("invoice")
 if not logger.handlers:
     logger.setLevel(logging.INFO)
-    _fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(name)s: %(message)s")
-    _fh = RotatingFileHandler("app.log", maxBytes=1_048_576, backupCount=5, encoding="utf-8")
-    _fh.setFormatter(_fmt)
-    _sh = logging.StreamHandler(sys.stdout)
-    _sh.setFormatter(_fmt)
-    logger.addHandler(_fh)
-    logger.addHandler(_sh)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    fh = logging.FileHandler("invoice_app.log", encoding="utf-8")
+    fh.setFormatter(fmt)
+    stream_h = logging.StreamHandler(log_stream)
+    stream_h.setFormatter(fmt)
+    logger.addHandler(sh)
+    logger.addHandler(fh)
+    logger.addHandler(stream_h)
     logger.propagate = False
 
-# ── constants ────────────────────────────────────────────────────
-VAT_RATE = 0.20
-RULES_DEFAULT_PATH = "analogs_priority.xlsx"
-FIXED_STOCK_ROW = 9
-FIXED_STOCK_COL = 1
+# ----------------------------------------------------------------------------
+# constants
+VALUE_EPS = 0.01
+VAT_RATE = 20.0 / 120.0
 
-# если понадобится чуть «мягче» сравнивать суммы — можно подкрутить
-AMOUNT_ABS_TOL = 0.0     # абсолютная толерантность по сумме, ₽
-AMOUNT_REL_TOL = 0.00    # относительная, доля (0.05 = 5%)
+# ----------------------------------------------------------------------------
+# helpers
 
-# подбор аналогов по стоимости допускает отклонение 3%
-VALUE_TOL = 0.03
+def resolve_existing_path(path: str) -> str:
+    """Resolve path with normalization and search.
+    Logs resolution info. Returns found path or original expanded path.
+    """
+    orig = path
+    path = os.path.expanduser(path)
+    def exists(p: str) -> Optional[str]:
+        if os.path.exists(p):
+            return os.path.abspath(p)
+        return None
+    for candidate in [path, os.path.abspath(path)]:
+        res = exists(candidate)
+        if res:
+            logger.info("[%s] resolved to: %s", orig, res)
+            return res
+    for form in ["NFC", "NFD", "NFKC", "NFKD"]:
+        normed = unicodedata.normalize(form, path)
+        res = exists(normed)
+        if res:
+            logger.info("[%s] resolved to: %s", orig, res)
+            return res
+    search_dirs: List[str] = []
+    cwd = os.getcwd()
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    search_dirs.extend([cwd, script_dir, os.path.dirname(script_dir)])
+    home = os.path.expanduser("~")
+    search_dirs.extend([home, os.path.join(home, "Downloads"), os.path.join(home, "Desktop")])
+    search_dirs = [d for d in search_dirs if os.path.isdir(d)]
+    base = os.path.basename(path)
+    pattern = base if any(ch in base for ch in "*?") else f"*{base}*"
+    found: List[str] = []
+    for d in search_dirs:
+        for root, dirs, files in os.walk(d):
+            if root.startswith("/System") or root.startswith("/Library") or root.startswith("/usr"):
+                dirs[:] = []
+                continue
+            for name in files:
+                if fnmatch.fnmatch(name.lower(), pattern.lower()):
+                    full = os.path.join(root, name)
+                    found.append(full)
+                    if name.lower() == base.lower():
+                        logger.info("[%s] resolved to: %s", orig, full)
+                        return full
+    if found:
+        logger.info("[%s] not found. Candidates:", orig)
+        for f in found[:10]:
+            logger.info("  %s", f)
+    else:
+        logger.info("[%s] not found", orig)
+    return path
 
-_catalog = load_catalog()
+def to_str_cell(x) -> str:
+    if pd.isna(x):
+        return ""
+    return str(x).strip()
 
+def to_float_cell(x) -> Optional[float]:
+    if pd.isna(x):
+        return None
+    try:
+        return float(str(x).replace(" ", "").replace(",", "."))
+    except Exception:
+        return None
 
-@dataclass
-class AnalogCandidate:
-    base: str
-    price: Optional[float] = None
+def round_qty(x: float) -> float:
+    return round(float(x), 2)
 
-# ── helpers ──────────────────────────────────────────────────────
-def _normalize(col: str) -> str:
-    return (
-        str(col).lower()
-        .replace("\n", "").replace("\r", "").replace("\t", "")
-        .replace(" ", "").replace("-", "").replace("ё", "е")
-    )
+def round_money(x: float) -> float:
+    return round(float(x), 2)
 
-def _find_header_row(path: str, max_row: int = 40) -> int:
-    for i in range(max_row):
-        row = pd.read_excel(path, skiprows=i, nrows=1, header=None).fillna("")
-        cells = [_normalize(str(c)) for c in row.values.ravel()]
-        has_code = any(c.startswith(("код", "артикул")) for c in cells)
-        has_qty  = any(c.startswith(("количест", "колво", "qty")) for c in cells)
-        if has_code and has_qty:
-            return i
-    raise ValueError("Header row not found")
+def looks_like_code_scalar(s: str) -> bool:
+    if not s:
+        return False
+    if re.search(r"[А-Яа-я]", s):
+        return False
+    return bool(re.search(r"\d{4,6}", s))
 
 def extract_base_code(s: str) -> str:
-    m = re.search(r"\d{4,6}", str(s))
-    return m.group(0) if m else ""
+    if not s:
+        return ""
+    m = re.search(r"\d{6}", s)
+    if m:
+        return m.group(0)
+    m = re.search(r"\d{5}", s)
+    if m:
+        return m.group(0)
+    m = re.search(r"\d{4}", s)
+    if m:
+        return m.group(0)
+    return ""
 
-def swap_base_in_code(code_str: str, new_base: str) -> str:
-    """Заменяет первую группу 4–6 цифр на новую базу, остальное сохраняет."""
-    code_str = str(code_str)
-    m = re.search(r"(\d{4,6})", code_str)
-    if not m:
-        return str(new_base)
-    s, e = m.span(1)
-    return code_str[:s] + str(new_base) + code_str[e:]
+# ----------------------------------------------------------------------------
+# loading
 
-def load_analog_rules(path: str = RULES_DEFAULT_PATH) -> Dict[str, List[AnalogCandidate]]:
+def load_analog_rules(path: str) -> Dict[str, List[Tuple[str, Optional[float]]]]:
+    path = resolve_existing_path(path)
     if not os.path.exists(path):
         return {}
     df = pd.read_excel(path, dtype=str).fillna("")
-
-    def norm(x: str) -> str:
-        return str(x).strip().lower().replace(" ", "")
-
-    base_candidates = {"товар", "база", "код", "артикул"}
-    base_col = next((c for c in df.columns if norm(c) in base_candidates), df.columns[0])
-
-    analog_cols = [c for c in df.columns if ("аналог" in norm(c) or "analog" in norm(c))]
-    price_cols = [c for c in df.columns if ("цена" in norm(c) or "price" in norm(c))]
-
+    columns = list(df.columns)
+    base_col = 0
+    for i, c in enumerate(columns):
+        s = to_str_cell(c).lower()
+        if any(k in s for k in ["товар", "база", "код", "артикул", "base"]):
+            base_col = i
+            break
+    analog_cols: List[int] = []
+    price_cols: List[int] = []
+    for i, c in enumerate(columns):
+        s = to_str_cell(c).lower()
+        if "аналог" in s or "analog" in s:
+            analog_cols.append(i)
+        if "цена" in s or "price" in s:
+            price_cols.append(i)
     if not analog_cols:
-        analog_cols = [c for c in df.columns if c not in {base_col} | set(price_cols)]
-
-    def suffix(name: str) -> str:
-        m = re.search(r"(\d+)$", norm(name))
-        return m.group(1) if m else ""
-
-    price_by_suffix = {suffix(c): c for c in price_cols if suffix(c)}
-    default_price_col = next((c for c in price_cols if suffix(c) == ""), None)
-
-    rules: Dict[str, List[AnalogCandidate]] = {}
+        analog_cols = [i for i in range(len(columns)) if i != base_col and i not in price_cols]
+    pairs: Dict[int, Optional[int]] = {}
+    for ac in analog_cols:
+        suf = re.findall(r"\d+", to_str_cell(columns[ac]))
+        price_match = None
+        if suf:
+            for pc in price_cols:
+                if re.findall(r"\d+", to_str_cell(columns[pc])) == suf:
+                    price_match = pc
+                    break
+        if price_match is None:
+            for offs in range(1,4):
+                if ac+offs in price_cols:
+                    price_match = ac+offs
+                    break
+        pairs[ac] = price_match
+    rules: Dict[str, List[Tuple[str, Optional[float]]]] = {}
     for _, row in df.iterrows():
-        base = extract_base_code(row.get(base_col, ""))
-        if not base:
+        base_code = extract_base_code(to_str_cell(row.iat[base_col]))
+        if not base_code:
             continue
-        candidates: List[AnalogCandidate] = []
-        for c in analog_cols:
-            cand_base = extract_base_code(row.get(c, ""))
-            if not cand_base or cand_base == base:
+        lst: List[Tuple[str, Optional[float]]] = []
+        for ac, pc in pairs.items():
+            analog_code = extract_base_code(to_str_cell(row.iat[ac]))
+            if not analog_code:
                 continue
-            suf = suffix(c)
             price_val = None
-            price_col = price_by_suffix.get(suf)
-            if price_col:
-                price_val = pd.to_numeric(row.get(price_col, ""), errors="coerce")
-            elif default_price_col:
-                price_val = pd.to_numeric(row.get(default_price_col, ""), errors="coerce")
-            price_val = float(price_val) if pd.notna(price_val) else None
-            if cand_base not in {cand.base for cand in candidates}:
-                candidates.append(AnalogCandidate(base=cand_base, price=price_val))
-        if candidates:
-            rules[base] = candidates
+            if pc is not None:
+                price_val = to_float_cell(row.iat[pc])
+            lst.append((analog_code, price_val))
+        if lst:
+            rules.setdefault(base_code, []).extend(lst)
     return rules
 
-def _is_filled(val) -> bool:
-    return pd.notna(val) and str(val).strip() != ""
+def load_flexy_catalog() -> DataFrame:
+    cat = flexy_catalog_loader.load_catalog()
+    if isinstance(cat, pd.DataFrame):
+        cat = cat.copy()
+        cat["BaseCode"] = cat["code"].map(extract_base_code)
+    else:
+        cat = pd.DataFrame(columns=["code", "price_rub", "BaseCode"])
+    return cat
 
-# ── stock ────────────────────────────────────────────────────────
-@dataclass
-class StockManager:
-    df: pd.DataFrame = field(default_factory=pd.DataFrame)
-    stock_column: str = "Остаток"
+def load_profiles_mapping(path: str) -> Dict[str, str]:
+    path = resolve_existing_path(path)
+    if not os.path.exists(path):
+        return {}
+    df = pd.read_excel(path, dtype=str).fillna("")
+    cols = list(df.columns)
+    code_col = 0
+    name_col = 1 if len(cols) > 1 else 0
+    for i, c in enumerate(cols):
+        s = to_str_cell(c).lower()
+        if any(k in s for k in ["код", "артикул", "sku", "code"]):
+            code_col = i
+        if any(k in s for k in ["товар", "наимен", "product", "name"]):
+            name_col = i
+    mapping: Dict[str, str] = {}
+    for _, row in df.iterrows():
+        code = to_str_cell(row.iat[code_col])
+        name = to_str_cell(row.iat[name_col])
+        if code and name:
+            mapping[code] = name
+    return mapping
 
-    def load(self, path: str) -> None:
-        raw = pd.read_excel(path, header=None)
-        qty = raw.iloc[FIXED_STOCK_ROW:, FIXED_STOCK_COL]
-        articles = raw.iloc[FIXED_STOCK_ROW:, 0]
+def load_stock(path: str, catalog: DataFrame) -> DataFrame:
+    path = resolve_existing_path(path)
+    df = pd.read_excel(path, header=None, skiprows=9, usecols=[0,1])
+    df.columns = ["code", "qty"]
+    df["code"] = df["code"].apply(to_str_cell)
+    df["qty"] = df["qty"].apply(to_float_cell).fillna(0)
+    df = df.groupby("code", as_index=False)["qty"].sum()
+    df["BaseCode"] = df["code"].map(extract_base_code)
+    catalog = catalog[["code", "price_rub", "BaseCode"]]
+    df = df.merge(catalog, on="code", how="left")
+    return df
 
-        self.df = pd.DataFrame({"Артикул": articles, "Остаток": qty})
-        self.df.dropna(how="all", inplace=True)
-        self.df.reset_index(drop=True, inplace=True)
+def read_invoice_table(path: str) -> Tuple[List[str], DataFrame, Dict[str,int]]:
+    path = resolve_existing_path(path)
+    df = pd.read_excel(path, header=None)
+    header_idx = 0
+    code_keys = ["код","артикул","sku","code","код/артикул","артикул/код"]
+    qty_keys = ["кол-во","количество","кол.","qty","quantity","кол"]
+    for i in range(min(80, len(df))):
+        row = [to_str_cell(x).lower() for x in df.iloc[i]]
+        has_code = any(any(k in cell for k in code_keys) for cell in row)
+        has_qty = any(any(k in cell for k in qty_keys) for cell in row)
+        if has_code and has_qty:
+            header_idx = i
+            break
+    headers = [to_str_cell(x) for x in df.iloc[header_idx]]
+    data = df.iloc[header_idx+1:].reset_index(drop=True)
+    roles: Dict[str,int] = {}
+    for idx, h in enumerate(headers):
+        hl = h.lower()
+        if any(k in hl for k in ["№","номер","no"]):
+            roles.setdefault("num", idx)
+        if any(k in hl for k in ["код","артикул","sku","code","код/артикул","артикул/код"]):
+            roles.setdefault("code", idx)
+        if any(k in hl for k in ["товар","наименование","product","name","наим"]):
+            roles.setdefault("name", idx)
+        if any(k in hl for k in ["кол-во","количество","кол.","qty","quantity","кол"]):
+            roles.setdefault("qty", idx)
+        if any(k in hl for k in ["ед","unit"]):
+            roles.setdefault("unit", idx)
+        if any(k in hl for k in ["цена","price"]):
+            roles.setdefault("price", idx)
+        if any(k in hl for k in ["в т.ч. ндс","ндс"]):
+            roles.setdefault("nds", idx)
+        if any(k in hl for k in ["сумма","итого","total","стоимость","всего"]):
+            roles.setdefault("total", idx)
+    return headers, data, roles
 
-        self.df["Артикул"] = self.df["Артикул"].astype(str).str.strip()
-        self.df["Остаток"] = pd.to_numeric(self.df["Остаток"], errors="coerce").fillna(0.0)
-        self.df["BaseCode"] = self.df["Артикул"].map(extract_base_code)
+# ----------------------------------------------------------------------------
+# processing
 
-        # подцепим цены (если есть в каталоге)
-        if isinstance(_catalog, pd.DataFrame) and {"code", "price_rub"} <= set(_catalog.columns):
-            cat = _catalog.copy()
-            cat["code"] = cat["code"].astype(str).str.strip()
-            enrich = cat[["code", "price_rub"]].rename(columns={"code": "Артикул"})
-            enrich["price_rub"] = pd.to_numeric(enrich["price_rub"], errors="coerce")
-            self.df = self.df.merge(enrich, on="Артикул", how="left")
+def process_invoice(headers: List[str], data: DataFrame, roles: Dict[str,int], stock_df: DataFrame,
+                     rules: Dict[str,List[Tuple[str,Optional[float]]]], profiles: Dict[str,str],
+                     catalog: DataFrame) -> DataFrame:
+    stock_dict: Dict[str, Dict[str, Optional[float]]] = {}
+    for _, r in stock_df.iterrows():
+        stock_dict[r["code"]] = {
+            "qty": float(r["qty"]),
+            "price": to_float_cell(r.get("price_rub")),
+            "base": to_str_cell(r.get("BaseCode"))
+        }
+    stock_by_base: Dict[str, List[str]] = {}
+    for code, info in stock_dict.items():
+        stock_by_base.setdefault(info["base"], []).append(code)
 
-        self.stock_column = "Остаток"
-        logger.info(f"Загружено {len(self.df)} строк остатков")
-
-    def total_for_article(self, article: str) -> float:
-        rows = self.df[self.df["Артикул"] == article]
-        return float(rows[self.stock_column].sum()) if not rows.empty else 0.0
-
-    def total_for_base(self, base_code: str) -> float:
-        rows = self.df[self.df["BaseCode"] == base_code]
-        return float(rows[self.stock_column].sum()) if not rows.empty else 0.0
-
-    def avg_price_for_base(self, base_code: str) -> Optional[float]:
-        pool = self.df[self.df["BaseCode"] == base_code]
-        if pool.empty:
-            return None
-        pr = pd.to_numeric(pool.get("price_rub"), errors="coerce")
-        pr = pr[pr.notna()]
-        if pr.empty:
-            return None
-        return float(pr.mean())
-
-    def allocate_partial(self, article: str, qty: float) -> float:
-        """Снимает со склада до qty метров по точному артикулу и возвращает отпущенное количество."""
-        pool = self.df[(self.df["Артикул"] == article) & (self.df[self.stock_column] > 0)]
-        left = float(qty)
-        shipped = 0.0
-        for idx, r in pool.iterrows():
-            if left <= 0:
-                break
-            avail = float(r[self.stock_column])
-            take = min(avail, left)
-            if take > 0:
-                self.df.at[idx, self.stock_column] = avail - take
-                left -= take
-                shipped += take
-        return shipped
-
-    def allocate_value_by_base(
-        self,
-        base_code: str,
-        target_value: float,
-        price_override: Optional[float],
-        tol_value: float,
-    ) -> Tuple[List[Tuple[pd.Series, float]], float]:
-        pool = self.df[(self.df["BaseCode"] == base_code) & (self.df[self.stock_column] > 0)].copy()
-        if pool.empty or target_value <= tol_value:
-            return [], target_value
-
-        if price_override is not None:
-            pool["unit_price"] = float(price_override)
-        else:
-            pool["unit_price"] = pd.to_numeric(pool.get("price_rub"), errors="coerce")
-
-        missing = pool[pool["unit_price"].isna()]
-        for _, r in missing.iterrows():
-            logger.warning(f"{r['Артикул']}: отсутствует цена; строка пропущена")
-        pool.dropna(subset=["unit_price"], inplace=True)
-        pool = pool[pool["unit_price"] > 0]
-        if pool.empty:
-            return [], target_value
-
-        if price_override is not None:
-            pool = pool.sort_values(self.stock_column, ascending=False)
-        else:
-            pool = pool.sort_values(["unit_price", self.stock_column], ascending=[True, False])
-
-        remaining = float(target_value)
-        allocations: List[Tuple[pd.Series, float]] = []
-        for idx, r in pool.iterrows():
-            if remaining <= tol_value:
-                break
-            avail = float(r[self.stock_column])
-            unit_price = float(r["unit_price"])
-            qty = min(avail, remaining / unit_price)
-            qty = round(qty, 2)
-            if qty <= 0:
+    result_rows: List[List] = []
+    for row_idx in range(len(data)):
+        row = data.iloc[row_idx]
+        qty = to_float_cell(row.iat[roles.get("qty", -1)]) if "qty" in roles else None
+        if qty is None or qty <= 0:
+            continue
+        code_cell = to_str_cell(row.iat[roles.get("code", -1)]) if "code" in roles else ""
+        name_cell = to_str_cell(row.iat[roles.get("name", -1)]) if "name" in roles else ""
+        price_src = to_float_cell(row.iat[roles.get("price", -1)]) if "price" in roles else None
+        total_src = to_float_cell(row.iat[roles.get("total", -1)]) if "total" in roles else None
+        code = code_cell
+        if not looks_like_code_scalar(code):
+            code = extract_base_code(name_cell)
+        if not code:
+            code = extract_base_code(code_cell)
+        if not code:
+            text = " ".join([to_str_cell(x) for x in row.tolist()])
+            code = extract_base_code(text)
+        base_code = extract_base_code(code)
+        name = profiles.get(code, code)
+        if not code or qty is None:
+            continue
+        stock_info = stock_dict.get(code)
+        if stock_info and stock_info["qty"] >= qty:
+            chosen_price = price_src if price_src is not None else stock_info["price"]
+            if chosen_price is None:
+                cat_price = catalog.loc[catalog["code"]==code, "price_rub"].dropna()
+                if not cat_price.empty:
+                    chosen_price = float(cat_price.iloc[0])
+            if chosen_price is None:
+                logger.info("%s: не удалось вычислить цену", code)
                 continue
-            self.df.at[idx, self.stock_column] = avail - qty
-            row_data = self.df.loc[idx].copy()
-            allocations.append((row_data, qty))
-            remaining -= qty * unit_price
-
-        return allocations, remaining
-
-    def display_name_for_base(self, base_code: str) -> str:
-        rows = self.df[self.df["BaseCode"] == base_code]
-        if not rows.empty:
-            return str(rows.iloc[0]["Артикул"])
-        return f"Профиль {base_code}"
-
-# ── invoice ──────────────────────────────────────────────────────
-@dataclass
-class InvoiceProcessor:
-    stock: StockManager
-    app: Optional["App"] = None
-    df: pd.DataFrame = field(default_factory=pd.DataFrame)
-    raw_df: pd.DataFrame = field(default_factory=pd.DataFrame)
-
-    original_sum: float = 0.0
-    result_rows: List[dict] = field(default_factory=list)
-    log: List[str] = field(default_factory=list)
-    invoice_path: Optional[str] = None
-    header_row_idx: int = 0
-    output_columns: List[str] = field(default_factory=list)
-
-    col_code: str = "Артикул"
-    col_qty: str = "Количество"
-    col_price: str = "Цена"
-    col_code_orig: Optional[str] = None
-    col_qty_orig: Optional[str] = None
-    col_price_orig: Optional[str] = None
-    col_name_orig: Optional[str] = None
-
-    def load(self, path: str) -> None:
-        hdr = _find_header_row(path)
-        base = pd.read_excel(path, skiprows=hdr, header=0, dtype=str)
-        self.invoice_path = path
-        self.header_row_idx = hdr
-
-        self.raw_df = base.copy()
-        self.output_columns = list(base.columns)
-        if "Комментарий" not in self.output_columns:
-            self.output_columns.append("Комментарий")
-
-        df = base.copy()
-        rename_map: dict[str, str] = {}
-        for col in df.columns:
-            norm = _normalize(col)
-            if norm.startswith(("код", "артикул")):
-                rename_map[col] = "Артикул"
-            elif norm.startswith(("количест", "колво", "qty")):
-                rename_map[col] = "Количество"
-            elif norm.startswith(("цена", "стоимость", "price")):
-                rename_map[col] = "Цена"
-            elif norm.startswith(("товар", "наимен", "product", "item")):
-                rename_map[col] = "Товар"
-        df.rename(columns=rename_map, inplace=True)
-
-        if "Цена" not in df.columns:
-            df["Цена"] = pd.NA
-
-        df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
-        df.dropna(how="all", inplace=True)
-
-        df["Количество"] = pd.to_numeric(df["Количество"], errors="coerce")
-        df["Цена"] = pd.to_numeric(df.get("Цена"), errors="coerce")
-        df.dropna(subset=["Количество"], inplace=True)
-
-        self.raw_df = self.raw_df.loc[df.index].copy()
-        df.reset_index(drop=True, inplace=True)
-        self.raw_df.reset_index(drop=True, inplace=True)
-
-        self.col_code = "Артикул"
-        self.col_qty = "Количество"
-        self.col_price = "Цена"
-
-        inv_map = {v: k for k, v in rename_map.items()}
-        self.col_code_orig = inv_map.get("Артикул")
-        self.col_qty_orig = inv_map.get("Количество")
-        self.col_price_orig = inv_map.get("Цена")
-        self.col_name_orig = inv_map.get("Товар")
-
-        if self.col_code_orig is None and "Артикул" in self.output_columns:
-            self.col_code_orig = "Артикул"
-        if self.col_qty_orig is None and "Количество" in self.output_columns:
-            self.col_qty_orig = "Количество"
-        if self.col_price_orig is None and "Цена" in self.output_columns:
-            self.col_price_orig = "Цена"
-        if self.col_name_orig is None and "Товар" in self.output_columns:
-            self.col_name_orig = "Товар"
-
-        self.df = df
-
-        if self.df["Цена"].notna().any():
-            self.original_sum = (self.df["Количество"] * self.df["Цена"]).sum()
-            logger.info(f"Загружен счёт на {self.original_sum:,.2f} ₽")
-        else:
-            self.original_sum = 0.0
-            logger.info("Загружен счёт без цен")
-
-    def process(self) -> None:
-        self.result_rows.clear()
-        self.log.clear()
-
-        rules = self.app.rules if self.app and getattr(self.app, "rules", None) else {}
-
-        for (idx, row), (_, orig_row) in zip(self.df.iterrows(), self.raw_df.iterrows()):
-            art = str(row.get(self.col_code, "")).strip()
-            if not art:
-                continue
-            need = float(row.get(self.col_qty, 0) or 0)
-
-            price = row.get(self.col_price, pd.NA)
-            if pd.isna(price):
-                cat_row = _catalog[_catalog["code"] == art]
-                if not cat_row.empty:
-                    price = pd.to_numeric(cat_row.iloc[0].get("price_rub"), errors="coerce")
-            orig_price = float(price) if pd.notna(price) else 0.0
-
-            target_sum = need * orig_price
-            tol_value = max(10.0, VALUE_TOL * target_sum)
-
-            shipped = self.stock.allocate_partial(art, need)
-            shipped_sum = shipped * orig_price
-            self.log.append(
-                f"{art}: отгружено {shipped:.2f} м исходного кода по {orig_price:.2f} → {shipped_sum:.2f} ₽"
-            )
-            if shipped > 0:
-                rec = {c: orig_row.get(c, "") for c in self.output_columns}
-                if self.col_code_orig:
-                    rec[self.col_code_orig] = art
-                if self.col_qty_orig:
-                    rec[self.col_qty_orig] = shipped
-                if self.col_price_orig:
-                    rec[self.col_price_orig] = orig_price
-                self.result_rows.append(rec)
-
-            value_left = max(target_sum - shipped_sum, 0.0)
-            if value_left <= tol_value:
-                continue
-
-            self.log.append(f"{art}: добираем {value_left:.2f} ₽ аналогами")
-            base_code = extract_base_code(art)
-            candidates = rules.get(base_code, [])
-            for cand in candidates:
-                allocs, value_left = self.stock.allocate_value_by_base(
-                    cand.base, value_left, cand.price, tol_value
-                )
-                for stock_row, qty in allocs:
-                    analog_code = str(stock_row.get("Артикул"))
-                    unit_price = cand.price if cand.price is not None else float(stock_row.get("price_rub", 0) or 0)
-                    analog_sum = qty * unit_price
-                    rec = {c: orig_row.get(c, "") for c in self.output_columns}
-                    if self.col_code_orig:
-                        rec[self.col_code_orig] = analog_code
-                    if self.col_name_orig:
-                        rec[self.col_name_orig] = analog_code
-                    if self.col_qty_orig:
-                        rec[self.col_qty_orig] = qty
-                    if self.col_price_orig:
-                        rec[self.col_price_orig] = unit_price
-                    self.result_rows.append(rec)
-                    self.log.append(
-                        f"{art}: {qty:.2f} м → {analog_code} по {unit_price:.2f} ({analog_sum:.2f} ₽)"
-                    )
-                if value_left <= tol_value:
+            chosen_price = round_money(chosen_price)
+            total = round_money(chosen_price * qty)
+            nds = round_money(total * VAT_RATE)
+            new_row = list(row)
+            if "code" in roles:
+                new_row[roles["code"]] = code
+            if "name" in roles:
+                new_row[roles["name"]] = name
+            if "qty" in roles:
+                new_row[roles["qty"]] = round_qty(qty)
+            if "price" in roles:
+                new_row[roles["price"]] = chosen_price
+            if "total" in roles:
+                new_row[roles["total"]] = total
+            if "nds" in roles:
+                new_row[roles["nds"]] = nds
+            result_rows.append(new_row)
+            stock_info["qty"] -= qty
+            logger.info("%s: %.2f → без замены по %.2f (со склада)", code, qty, chosen_price)
+            continue
+        if not base_code or base_code not in rules:
+            logger.info("%s: строка не закрыта (нет правил)", code)
+            continue
+        target_total = price_src * qty if price_src is not None else None
+        remaining_qty = qty
+        acc_value = 0.0
+        analog_rows: List[List] = []
+        for analog_base, rule_price in rules.get(base_code, []):
+            for stock_code in stock_by_base.get(analog_base, []):
+                info = stock_dict.get(stock_code)
+                if info is None or info["qty"] <= 0:
+                    continue
+                price_choice = rule_price
+                price_source = "по правилам" if rule_price is not None else None
+                if price_choice is None:
+                    price_choice = info["price"]
+                    price_source = "из каталога" if price_choice is not None else None
+                if price_choice is None:
+                    price_choice = price_src
+                    price_source = "исходная цена" if price_choice is not None else None
+                if price_choice is None:
+                    continue
+                take_qty = min(info["qty"], remaining_qty)
+                if target_total is not None:
+                    if acc_value + take_qty*price_choice > target_total*(1+VALUE_EPS):
+                        take_qty = max(0, (target_total - acc_value)/price_choice)
+                take_qty = round_qty(take_qty)
+                if take_qty <= 0:
+                    continue
+                line_total = round_money(price_choice * take_qty)
+                nds = round_money(line_total * VAT_RATE)
+                new_row = list(row)
+                if "code" in roles:
+                    new_row[roles["code"]] = stock_code
+                if "name" in roles:
+                    new_row[roles["name"]] = profiles.get(stock_code, stock_code)
+                if "qty" in roles:
+                    new_row[roles["qty"]] = take_qty
+                if "price" in roles:
+                    new_row[roles["price"]] = round_money(price_choice)
+                if "total" in roles:
+                    new_row[roles["total"]] = line_total
+                if "nds" in roles:
+                    new_row[roles["nds"]] = nds
+                analog_rows.append(new_row)
+                info["qty"] -= take_qty
+                remaining_qty = round_qty(remaining_qty - take_qty)
+                acc_value = round_money(acc_value + line_total)
+                logger.info("%s: %.2f → %s по %.2f (%s)", code, take_qty, stock_code, price_choice, price_source)
+                if remaining_qty <= 0:
                     break
+            if remaining_qty <= 0:
+                break
+        if remaining_qty > 0:
+            logger.info("%s: строка не закрыта (нехватка аналога)", code)
+            for nr in analog_rows:
+                scode = to_str_cell(nr[roles["code"]]) if "code" in roles else ""
+                qty_back = to_float_cell(nr[roles["qty"]]) if "qty" in roles else 0
+                if scode in stock_dict:
+                    stock_dict[scode]["qty"] += qty_back
+            continue
+        if target_total is not None and abs(acc_value - target_total) > target_total*VALUE_EPS:
+            logger.info("итог исходной: %.2f ₽; собрано: %.2f ₽ (Δ=%+.2f ₽) — отклонение", target_total, acc_value, acc_value-target_total)
+            for nr in analog_rows:
+                scode = to_str_cell(nr[roles["code"]]) if "code" in roles else ""
+                qty_back = to_float_cell(nr[roles["qty"]]) if "qty" in roles else 0
+                if scode in stock_dict:
+                    stock_dict[scode]["qty"] += qty_back
+            continue
+        if target_total is not None:
+            logger.info("итог исходной: %.2f ₽; собрано: %.2f ₽ (Δ=%+.2f ₽)", target_total, acc_value, acc_value-target_total)
+        result_rows.extend(analog_rows)
+    cleaned: List[List] = []
+    for r in result_rows:
+        if any(to_str_cell(c) != "" for c in r):
+            cleaned.append(r)
+    result_df = pd.DataFrame(cleaned, columns=headers)
+    if "num" in roles:
+        for i in range(len(result_df)):
+            result_df.iat[i, roles["num"]] = i + 1
+    return result_df
 
-            if value_left > tol_value:
-                self.log.append(
-                    f"{art}: не хватило {value_left:.2f} ₽ — аналоги закончились"
-                )
+# ----------------------------------------------------------------------------
+# saving
 
-    def to_dataframe(self) -> pd.DataFrame:
-        if not self.result_rows:
-            return pd.DataFrame(columns=self.output_columns)
-        return pd.DataFrame(self.result_rows, columns=self.output_columns)
+def save_result(headers: List[str], df: DataFrame, original_invoice_path: str) -> str:
+    out_path = os.path.splitext(original_invoice_path)[0] + "_processed.xlsx"
+    df_out = pd.DataFrame([headers] + df.values.tolist())
+    df_out.to_excel(out_path, header=False, index=False)
+    logger.info("Сохранён файл: %s", out_path)
+    return out_path
 
-    def save(self, path: str) -> None:
-        """Перезаписываем ТОЛЬКО табличную часть исходного файла, сохраняя шапку/визуал."""
-        if not self.invoice_path:
-            raise RuntimeError("invoice_path is not set")
+# ----------------------------------------------------------------------------
+# GUI
 
-        out_df = self.to_dataframe()
-        rows = out_df.to_dict(orient="records")
+class InvoiceGUI:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Invoice App")
+        self.stock_path = ""
+        self.invoice_path = ""
+        self.rules_path = "analogs_priority.xlsx"
+        self.profiles_path = "profiles_catalog.xlsx"
 
-        wb = load_workbook(self.invoice_path)
-        ws = wb.active
+        frm = tk.Frame(self.root)
+        frm.pack(padx=10, pady=10)
+        self.stock_label = tk.Label(frm, text="Остатки: -")
+        self.stock_label.pack(anchor="w")
+        self.invoice_label = tk.Label(frm, text="Счёт: -")
+        self.invoice_label.pack(anchor="w")
+        tk.Button(frm, text="Загрузить остатки", command=self.load_stock).pack(fill="x")
+        tk.Button(frm, text="Загрузить счёт", command=self.load_invoice).pack(fill="x")
+        tk.Button(frm, text="Собрать счёт", command=self.build_invoice).pack(fill="x")
+        tk.Button(frm, text="Посмотреть логи", command=self.show_logs).pack(fill="x")
+        tk.Button(frm, text="Скачать логи", command=self.save_logs).pack(fill="x")
 
-        header_row_1 = self.header_row_idx + 1
-        headers = [cell.value for cell in ws[header_row_1]]
-        norm_headers = [_normalize(h) if h is not None else "" for h in headers]
+    def load_stock(self):
+        p = filedialog.askopenfilename()
+        if p:
+            self.stock_path = resolve_existing_path(p)
+            self.stock_label.config(text=f"Остатки: {self.stock_path}")
 
-        def find_index(prefixes: tuple[str, ...]) -> Optional[int]:
-            for i, h in enumerate(norm_headers):
-                if any(h.startswith(p) for p in prefixes):
-                    return i
-            return None
+    def load_invoice(self):
+        p = filedialog.askopenfilename()
+        if p:
+            self.invoice_path = resolve_existing_path(p)
+            self.invoice_label.config(text=f"Счёт: {self.invoice_path}")
 
-        idx_item  = find_index(("товар", "наимен", "product", "item"))
-        idx_code  = find_index(("код", "артикул"))
-        idx_qty   = find_index(("количест", "колво", "qty"))
-        idx_price = find_index(("цена", "стоимость", "price"))
-        idx_total = find_index(("всего", "итого", "сумма"))
-        idx_vat   = find_index(("вт.чндс", "ндс"))
-        idx_comm  = next((i for i, h in enumerate(norm_headers) if "комментар" in h), None)
-
-        # очистить старые строки
-        start = header_row_1 + 1
-        if start <= ws.max_row:
-            ws.delete_rows(start, ws.max_row - header_row_1)
-
-        # записать новые строки
-        r = start
-        for rec in rows:
-            values = [rec.get(h, "") for h in headers]
-
-            q = 0.0
-            p = 0.0
-            try:
-                if self.col_qty_orig:
-                    q = float(rec.get(self.col_qty_orig, 0) or 0)
-                if self.col_price_orig:
-                    p = float(rec.get(self.col_price_orig, 0) or 0)
-            except Exception:
-                q = p = 0.0
-            if idx_total is not None:
-                values[idx_total] = round(q * p, 2)
-            if idx_vat is not None:
-                values[idx_vat] = round(q * p * VAT_RATE, 2)
-            if idx_comm is not None and idx_comm < len(values):
-                values[idx_comm] = rec.get("Комментарий", "")
-
-            for c, val in enumerate(values, start=1):
-                ws.cell(row=r, column=c, value=val)
-            r += 1
-
-        wb.save(path)
-        logger.info(f"Счёт сохранён в {path}")
-
-# ── GUI ──────────────────────────────────────────────────────────
-try:
-    from tkinter import Tk, filedialog, messagebox, Text, Scrollbar, Button, END, Toplevel
-except Exception:
-    Tk = filedialog = messagebox = Text = Scrollbar = Button = END = Toplevel = None
-
-class App:
-    def __init__(self) -> None:
-        self.root = Tk()
-        self.root.title("Invoice Builder")
-
-        self.log_text = Text(self.root, height=20, width=90, font=("Consolas", 10))
-        scroll_bar = Scrollbar(self.root, command=self.log_text.yview)
-        scroll_bar.pack(side="right", fill="y")
-        self.log_text.configure(yscrollcommand=scroll_bar.set)
-        self.log_text.pack(side="left", fill="both", expand=True)
-
-        Button(self.root, text="Загрузить остатки", command=self.load_stock).pack()
-        Button(self.root, text="Загрузить счёт", command=self.load_invoice).pack()
-        Button(self.root, text="Собрать счёт", command=self.build_invoice).pack()
-        Button(self.root, text="Загрузить правила", command=self.load_rules).pack()
-        Button(self.root, text="Посмотреть логи", command=self.view_logs).pack()
-        Button(self.root, text="Скачать логи", command=self.save_logs).pack()
-
-        self.stock = StockManager()
-        self.rules: Dict[str, List[AnalogCandidate]] = {}
-        try:
-            if os.path.exists(RULES_DEFAULT_PATH):
-                self.rules = load_analog_rules(RULES_DEFAULT_PATH)
-                logger.info(f"Правила загружены: {len(self.rules)} баз (авто)")
-            else:
-                logger.info("Правила не найдены")
-        except Exception:
-            logger.exception("Автозагрузка правил не удалась")
-
-        self.processor = InvoiceProcessor(stock=self.stock, app=self)
-        self.stock_file: Optional[str] = None
-        self.invoice_file: Optional[str] = None
-
-    def gui_log(self, msg: str) -> None:
-        self.log_text.insert(END, msg + "\n")
-        self.log_text.see(END)
-        logger.info(msg)
-
-    def view_logs(self) -> None:
-        top = Toplevel(self.root)
-        top.title("Логи приложения")
-        txt = Text(top, width=100, height=40, font=("Consolas", 10))
-        txt.pack(fill="both", expand=True)
-        try:
-            with open("app.log", "r", encoding="utf-8") as f:
-                txt.insert("end", f.read())
-        except FileNotFoundError:
-            txt.insert("end", "Лог-файл не найден")
-        txt.config(state="disabled")
-
-    def save_logs(self) -> None:
-        dst = filedialog.asksaveasfilename(
-            defaultextension=".log",
-            filetypes=[("Log files", "*.log"), ("All files", "*.*")],
-        )
-        if dst:
-            shutil.copyfile("app.log", dst)
-            messagebox.showinfo("Логи сохранены", f"Файл сохранён: {dst}")
-
-    def load_stock(self) -> None:
-        path = filedialog.askopenfilename()
-        if not path:
+    def build_invoice(self):
+        if not self.stock_path or not self.invoice_path:
+            messagebox.showwarning("Недостаточно данных", "Загрузите остатки и счёт")
             return
-        try:
-            self.stock.load(path)
-            self.stock_file = path
-            self.gui_log(f"Остатки загружены: {len(self.stock.df)} строк")
-        except Exception as exc:
-            logger.exception("Ошибка при загрузке остатков")
-            messagebox.showerror("Ошибка", f"{type(exc).__name__}: {exc}")
+        catalog = load_flexy_catalog()
+        profiles = load_profiles_mapping(self.profiles_path)
+        rules = load_analog_rules(self.rules_path)
+        stock = load_stock(self.stock_path, catalog)
+        headers, data, roles = read_invoice_table(self.invoice_path)
+        result_df = process_invoice(headers, data, roles, stock, rules, profiles, catalog)
+        save_result(headers, result_df, self.invoice_path)
+        messagebox.showinfo("Готово", "Файл собран")
 
-    def load_invoice(self) -> None:
-        path = filedialog.askopenfilename()
-        if not path:
-            return
-        try:
-            self.processor.load(path)
-            self.invoice_file = path
-            self.gui_log(f"Счёт загружен: {len(self.processor.df)} строк")
-        except Exception as exc:
-            messagebox.showerror("Ошибка", str(exc))
+    def show_logs(self):
+        win = tk.Toplevel(self.root)
+        win.title("Логи")
+        text = scrolledtext.ScrolledText(win, width=100, height=30)
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", log_stream.getvalue())
+        text.config(state="disabled")
 
-    def load_rules(self) -> None:
-        path = filedialog.askopenfilename()
-        if not path:
-            return
-        try:
-            self.rules = load_analog_rules(path)
-            self.processor.app = self
-            self.gui_log(f"Правила загружены: {len(self.rules)} баз")
-        except Exception as exc:
-            messagebox.showerror("Ошибка", str(exc))
+    def save_logs(self):
+        p = filedialog.asksaveasfilename(defaultextension=".log")
+        if p:
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(log_stream.getvalue())
+            messagebox.showinfo("Сохранено", p)
 
-    def build_invoice(self) -> None:
-        if self.stock.df.empty or self.processor.df.empty:
-            messagebox.showwarning("Внимание", "Загрузите остатки и счёт")
-            return
-        self.processor.process()
-        base, _ = os.path.splitext(os.path.basename(self.invoice_file))
-        out_path = f"{base}_processed.xlsx"
-        self.processor.save(out_path)
-        self.gui_log("\n".join(self.processor.log))
-        messagebox.showinfo("Готово", f"Новый счёт сохранён: {out_path}")
-
-    def run(self) -> None:
+    def run(self):
         self.root.mainloop()
 
-# ── entrypoint ───────────────────────────────────────────────────
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Invoice Builder")
-    parser.add_argument("--cli", nargs=2, metavar=("STOCK", "INVOICE"), help="run without GUI")
-    parser.add_argument("--show-log", action="store_true", help="print last 100 log lines")
-    parser.add_argument("--rules", help="path to analog rules file")
-    args = parser.parse_args()
+# ----------------------------------------------------------------------------
+# CLI
 
-    if args.show_log:
-        if os.path.exists("app.log"):
-            with open("app.log", "r", encoding="utf-8") as f:
-                lines = f.readlines()[-100:]
-            for line in lines:
-                print(line, end="")
-        sys.exit(0)
+def run_cli(stock_path: str, invoice_path: str, rules_path: str, profiles_path: str) -> None:
+    catalog = load_flexy_catalog()
+    profiles = load_profiles_mapping(profiles_path)
+    rules = load_analog_rules(rules_path)
+    stock = load_stock(stock_path, catalog)
+    headers, data, roles = read_invoice_table(invoice_path)
+    result_df = process_invoice(headers, data, roles, stock, rules, profiles, catalog)
+    save_result(headers, result_df, resolve_existing_path(invoice_path))
 
+# ----------------------------------------------------------------------------
+# main
+
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("stock", nargs="?")
+    parser.add_argument("invoice", nargs="?")
+    parser.add_argument("--cli", action="store_true")
+    parser.add_argument("--rules", default="analogs_priority.xlsx")
+    parser.add_argument("--profiles", default="profiles_catalog.xlsx")
+    args = parser.parse_args(argv)
     if args.cli:
-        stock_path, invoice_path = args.cli
-        stock = StockManager()
-        rules_path = args.rules or RULES_DEFAULT_PATH
-        try:
-            rules = load_analog_rules(rules_path)
-            logger.info(f"Правила загружены: {len(rules)} баз")
-        except FileNotFoundError:
-            rules = {}
-            logger.info("Правила не найдены")
-        dummy_app = type("Dummy", (), {"rules": rules})()
-        proc = InvoiceProcessor(stock=stock, app=dummy_app)
-        stock.load(stock_path)
-        proc.load(invoice_path)
-        proc.process()
-        base, _ = os.path.splitext(os.path.basename(invoice_path))
-        out_path = f"{base}_processed.xlsx"
-        proc.save(out_path)
-        for line in proc.log:
-            print(line)
+        if not args.stock or not args.invoice:
+            print("Stock and invoice paths required in CLI mode")
+            return
+        run_cli(args.stock, args.invoice, args.rules, args.profiles)
     else:
-        app = App()
-        if args.rules:
-            try:
-                app.rules = load_analog_rules(args.rules)
-                logger.info(f"Правила загружены: {len(app.rules)} баз")
-            except FileNotFoundError:
-                logger.info("Правила не найдены")
-        app.processor.app = app
+        app = InvoiceGUI()
         app.run()
+
+if __name__ == "__main__":
+    main()
