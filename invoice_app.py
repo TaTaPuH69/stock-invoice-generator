@@ -21,7 +21,7 @@ logger = logging.getLogger("invoice")
 if not logger.handlers:
     logger.setLevel(logging.INFO)
     _fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(name)s: %(message)s")
-    _fh = RotatingFileHandler("app.log", maxBytes=1_048_576, backupCount=5, encoding="utf-8")
+    _fh = RotatingFileHandler("app.log", maxBytes=1048576, backupCount=5, encoding="utf-8")
     _fh.setFormatter(_fmt)
     _sh = logging.StreamHandler(sys.stdout)
     _sh.setFormatter(_fmt)
